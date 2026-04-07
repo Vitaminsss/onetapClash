@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # One-click deploy for Debian/Ubuntu: sub-api + nginx + certbot + systemd + vpn CLI
+
+# Strip Windows CRLF from this file before anything else runs
+# (safe to run multiple times; no-op if already LF)
+if grep -qU $'\r' "$0" 2>/dev/null; then
+  sed -i 's/\r$//' "$0"
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +68,12 @@ copy_payload() {
   install -m0644 "$SCRIPT_DIR/discover.py" "$SUB_ROOT/discover.py"
   install -m0755 "$SCRIPT_DIR/xray-hook.sh" "$SUB_ROOT/xray-hook.sh"
   install -m0755 "$SCRIPT_DIR/vpn" "/usr/local/bin/vpn"
+  # Strip Windows CRLF from all copied scripts/sources
+  sed -i 's/\r$//' \
+    "$SUB_ROOT/app.py" \
+    "$SUB_ROOT/discover.py" \
+    "$SUB_ROOT/xray-hook.sh" \
+    "/usr/local/bin/vpn"
   [[ -f "$SUB_ROOT/tokens.json" ]] || echo '[]' >"$SUB_ROOT/tokens.json"
   chmod 0640 "$SUB_ROOT/tokens.json" || true
 }
@@ -116,7 +130,11 @@ EOF
 
 write_nginx_site() {
   local domain="$1"
-  mkdir -p /var/www/html
+  mkdir -p /var/www/html /etc/nginx/sites-available /etc/nginx/sites-enabled
+  # Ensure nginx.conf includes sites-enabled if it doesn't already
+  if [[ -f /etc/nginx/nginx.conf ]] && ! grep -q 'sites-enabled' /etc/nginx/nginx.conf; then
+    sed -i '/http {/a\\tinclude /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+  fi
   cat >/etc/nginx/sites-available/sub-api <<EOF
 server {
     listen 80;
@@ -145,11 +163,23 @@ EOF
 
 run_certbot() {
   local domain="$1"
+  local email="${CERTBOT_EMAIL:-}"
+
   if certbot certificates 2>/dev/null | grep -q "$domain"; then
-    log "证书已存在，尝试续期/安装"
+    log "证书已存在，跳过申请"
+    return 0
   fi
-  certbot --nginx -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email --redirect || {
+
+  local certbot_args=("--nginx" "-d" "$domain" "--non-interactive" "--agree-tos" "--redirect")
+  if [[ -n "$email" ]]; then
+    certbot_args+=("--email" "$email")
+  else
+    certbot_args+=("--register-unsafely-without-email")
+  fi
+
+  certbot "${certbot_args[@]}" || {
     log "certbot 失败：请确认域名已解析到本机且 80 端口可达"
+    log "可手动补跑: certbot --nginx -d ${domain} --agree-tos --register-unsafely-without-email --redirect"
     return 0
   }
   nginx -t
@@ -159,7 +189,9 @@ run_certbot() {
 main() {
   need_root
   local domain="${1:-}"
-  [[ -n "$domain" ]] || die "用法: sudo bash deploy.sh <your.domain.com>"
+  # 可选：环境变量传邮箱给 certbot，例如 CERTBOT_EMAIL=you@example.com bash deploy.sh domain
+  [[ -n "$domain" ]] || die "用法: sudo bash deploy.sh <your.domain.com>
+  可选: CERTBOT_EMAIL=you@example.com sudo bash deploy.sh <your.domain.com>"
 
   install_packages
   copy_payload

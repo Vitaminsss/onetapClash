@@ -2,6 +2,11 @@
 # Helpers to merge users into Xray / sing-box JSON and inject stats API.
 # Source: /opt/sub-api/xray-hook.sh
 
+if grep -qU $'\r' "$0" 2>/dev/null; then
+  sed -i 's/\r$//' "$0"
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 ENV_FILE="${SUB_API_ENV:-/opt/sub-api/sub-api.env}"
