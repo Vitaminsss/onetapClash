@@ -86,7 +86,6 @@ xray_add_vless_user() {
             .settings.clients = $c + [{
               "id": $id,
               "email": $em,
-              "encryption": "none",
               "flow": "xtls-rprx-vision"
             }]
           end
@@ -147,18 +146,36 @@ singbox_remove_hy2_user() {
   mv "$tmp" "$f"
 }
 
+_xray_each_file() {
+  # 对单文件或分片目录里每个 JSON 执行回调 "$1 <file> $2"
+  local fn="$1" uuid="$2"
+  if [[ -d "$XRAY_CONFIG" ]]; then
+    for f in "$XRAY_CONFIG"/*.json; do
+      "$fn" "$f" "$uuid" || true
+    done
+  elif [[ -f "$XRAY_CONFIG" ]]; then
+    "$fn" "$XRAY_CONFIG" "$uuid"
+  fi
+}
+
 register_user() {
   local uuid="$1"
-  [[ -n "$XRAY_CONFIG" && -f "$XRAY_CONFIG" ]] && {
-    merge_xray_stats "$XRAY_CONFIG" || true
-    xray_add_vless_user "$XRAY_CONFIG" "$uuid"
-  }
+  if [[ -n "$XRAY_CONFIG" ]]; then
+    if [[ -d "$XRAY_CONFIG" ]]; then
+      for f in "$XRAY_CONFIG"/*.json; do
+        merge_xray_stats "$f" 2>/dev/null || true
+      done
+    elif [[ -f "$XRAY_CONFIG" ]]; then
+      merge_xray_stats "$XRAY_CONFIG" || true
+    fi
+    _xray_each_file xray_add_vless_user "$uuid"
+  fi
   [[ -n "$SINGBOX_CONFIG" && -f "$SINGBOX_CONFIG" ]] && singbox_add_hy2_user "$SINGBOX_CONFIG" "$uuid"
 }
 
 revoke_user() {
   local uuid="$1"
-  [[ -n "$XRAY_CONFIG" && -f "$XRAY_CONFIG" ]] && xray_remove_vless_user "$XRAY_CONFIG" "$uuid"
+  [[ -n "$XRAY_CONFIG" ]] && _xray_each_file xray_remove_vless_user "$uuid"
   [[ -n "$SINGBOX_CONFIG" && -f "$SINGBOX_CONFIG" ]] && singbox_remove_hy2_user "$SINGBOX_CONFIG" "$uuid"
 }
 
@@ -172,7 +189,15 @@ reload_cores() {
 }
 
 inject_stats_only() {
-  [[ -n "$XRAY_CONFIG" && -f "$XRAY_CONFIG" ]] && merge_xray_stats "$XRAY_CONFIG"
+  if [[ -n "$XRAY_CONFIG" ]]; then
+    if [[ -d "$XRAY_CONFIG" ]]; then
+      for f in "$XRAY_CONFIG"/*.json; do
+        merge_xray_stats "$f" 2>/dev/null || true
+      done
+    elif [[ -f "$XRAY_CONFIG" ]]; then
+      merge_xray_stats "$XRAY_CONFIG"
+    fi
+  fi
 }
 
 ensure_files() {

@@ -98,6 +98,9 @@ def build_proxies(domain: str, srv: dict, user_uuid: str) -> list[dict]:
             "skip-cert-verify": bool(vr.get("skip-cert-verify", False)),
         },
     ]
+    # 仅存在 REALITY 入站时，默认的「Vision」会连错协议（常表现为 Timeout）；由 deploy 写入 omit_vless_vision
+    if srv.get("omit_vless_vision"):
+        proxies = [p for p in proxies if p["name"] != name_vis]
     return proxies
 
 

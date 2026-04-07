@@ -36,10 +36,16 @@ stop_existing_services() {
 discover_paths() {
   local x s
   x=""
-  for c in /usr/local/etc/xray/config.json /etc/xray/config.json /etc/v2ray-agent/xray/conf/config.json \
-           /etc/v2ray-agent/xray/config.json; do
+  # 先找单文件，再找分片目录（v2ray-agent 常见布局）
+  for c in /usr/local/etc/xray/config.json /etc/xray/config.json \
+           /etc/v2ray-agent/xray/conf/config.json /etc/v2ray-agent/xray/config.json; do
     [[ -f "$c" ]] && x="$c" && break
   done
+  if [[ -z "$x" ]]; then
+    for d in /etc/v2ray-agent/xray/conf /usr/local/etc/xray/conf; do
+      [[ -d "$d" ]] && ls "$d"/*.json >/dev/null 2>&1 && x="$d" && break
+    done
+  fi
   s=""
   for c in /usr/local/etc/sing-box/config.json /etc/sing-box/config.json \
            /etc/v2ray-agent/sing-box/conf/config.json /etc/v2ray-agent/sing-box/config.json; do
@@ -100,13 +106,16 @@ build_server_json() {
   local xray_cfg="$2"
   local sing_cfg="$3"
   local xj sj
-  if [[ -n "$xray_cfg" && -f "$xray_cfg" ]]; then
-    xj="$(jq -c . "$xray_cfg" 2>/dev/null || echo '{}')"
+  if [[ -n "$xray_cfg" && -d "$xray_cfg" ]]; then
+    # 分片目录：合并所有 JSON 文件的 inbounds 为单个对象
+    xj="$(jq -Mcs '{inbounds: [.[].inbounds? // [] | .[]]}'  "$xray_cfg"/*.json 2>/dev/null || echo '{}')"
+  elif [[ -n "$xray_cfg" && -f "$xray_cfg" ]]; then
+    xj="$(jq -Mc . "$xray_cfg" 2>/dev/null || echo '{}')"
   else
     xj="{}"
   fi
   if [[ -n "$sing_cfg" && -f "$sing_cfg" ]]; then
-    sj="$(jq -c . "$sing_cfg" 2>/dev/null || echo '{}')"
+    sj="$(jq -Mc . "$sing_cfg" 2>/dev/null || echo '{}')"
   else
     sj="{}"
   fi
@@ -126,10 +135,10 @@ build_server_json() {
     | ($sing | if type == "object" then . else {} end) as $S
     | (
         if ($X | keys | length) == 0 then
-          vless_defaults($domain)
+          { vx: vless_defaults($domain), tls_hit: false, reality_hit: false }
         else
           reduce ($X.inbounds // [])[] as $ib (
-            vless_defaults($domain);
+            { vx: vless_defaults($domain), tls_hit: false, reality_hit: false };
             if ($ib | type) != "object" or ($ib.protocol != "vless") then .
             else
               ($ib.streamSettings // {}) as $st
@@ -142,22 +151,29 @@ build_server_json() {
                      else null end
                  else null end) as $sni
               | if ($sec == "reality") or (($re | keys | length) > 0) then
-                  .vless_reality |= (
+                  .reality_hit = true
+                  | .vx.vless_reality |= (
                     (if $ib.port then .port = ($ib.port | tonumber) else . end)
                     | (if ($re.serverNames | type) == "array" and ($re.serverNames | length) > 0
-                       then .sni = $re.serverNames[0] else . end)
-                    | (if $re.publicKey then .public_key = $re.publicKey
-                       elif $re.public_key then .public_key = $re.public_key else . end)
+                       then .sni = $re.serverNames[0]
+                       elif ($re.dest | type) == "string" and ($re.dest | length) > 0
+                       then .sni = $re.dest
+                       else . end)
+                    | (if $re.publicKey then .public_key = ($re.publicKey | tostring)
+                       elif $re.public_key then .public_key = ($re.public_key | tostring) else . end)
                     | (if ($re.shortIds | type) == "array" and ($re.shortIds | length) > 0
                        then .short_id = ($re.shortIds[0] | tostring)
                        elif ($re.short_ids | type) == "array" and ($re.short_ids | length) > 0
                        then .short_id = ($re.short_ids[0] | tostring)
+                       elif ($re.shortId | type) == "string" and ($re.shortId | length) > 0
+                       then .short_id = ($re.shortId | tostring)
                        elif ($re.short_id | type) == "string"
                        then .short_id = $re.short_id
                        else . end)
                   )
                 else
-                  .vless_tls |= (
+                  .tls_hit = true
+                  | .vx.vless_tls |= (
                     (if $ib.port then .port = ($ib.port | tonumber) else . end)
                     | (if $sni != null and ($sni | tostring | length) > 0 then .sni = $sni else . end)
                   )
@@ -165,7 +181,7 @@ build_server_json() {
             end
           )
         end
-      ) as $vx
+      ) as $acc
     | (
         if ($S | keys | length) == 0 then
           {port: 9999, sni: $domain, alpn: ["h3"]}
@@ -184,9 +200,10 @@ build_server_json() {
       ) as $hy
     | {
         domain: $domain,
-        vless_tls: $vx.vless_tls,
-        vless_reality: $vx.vless_reality,
-        hysteria2: $hy
+        vless_tls: $acc.vx.vless_tls,
+        vless_reality: $acc.vx.vless_reality,
+        hysteria2: $hy,
+        omit_vless_vision: ($acc.reality_hit and ($acc.tls_hit | not))
       }
     ' >"$SUB_ROOT/server.json"
 }
@@ -239,8 +256,19 @@ merge_xray_stats_deploy() {
 inject_xray() {
   local xray_cfg="${1:-}"
   export SUB_API_ENV="$ENV_FILE"
-  [[ -n "$xray_cfg" && -f "$xray_cfg" ]] || { log "inject xray stats skipped (no xray config)"; return 0; }
-  merge_xray_stats_deploy "$xray_cfg" "$XRAY_API_PORT_DEPLOY" || log "inject xray stats failed"
+  if [[ -z "$xray_cfg" ]]; then
+    log "inject xray stats skipped (no xray config)"
+    return 0
+  fi
+  if [[ -d "$xray_cfg" ]]; then
+    for f in "$xray_cfg"/*.json; do
+      merge_xray_stats_deploy "$f" "$XRAY_API_PORT_DEPLOY" 2>/dev/null || true
+    done
+  elif [[ -f "$xray_cfg" ]]; then
+    merge_xray_stats_deploy "$xray_cfg" "$XRAY_API_PORT_DEPLOY" || log "inject xray stats failed"
+  else
+    log "inject xray stats skipped (no xray config)"
+  fi
 }
 
 reload_cores_deploy() {
@@ -462,7 +490,7 @@ main() {
 
   export SUB_API_ENV="$ENV_FILE"
   inject_xray "$xray_cfg"
-  if [[ -n "$xray_cfg" && -f "$xray_cfg" ]]; then
+  if [[ -n "$xray_cfg" ]]; then
     reload_cores_deploy
   fi
 
