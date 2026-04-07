@@ -117,7 +117,8 @@ singbox_hy2_traffic_for_uuid() {
 
 cmd_list() {
   ensure_files
-  printf "%-10s %-16s %-20s %-12s %-12s %-12s %-12s\n" "TOKEN" "备注" "创建时间" "Xray↑" "Xray↓" "H2↑" "H2↓"
+  printf "%-10s %-36s %-12s %-19s %-10s %-10s %-10s %-10s\n" \
+    "TOKEN" "UUID" "备注" "创建时间" "Xray↑" "Xray↓" "H2↑" "H2↓"
   while IFS= read -r row; do
     [[ -z "$row" ]] && continue
     local tok label created uuid xu xd hu hd
@@ -125,11 +126,21 @@ cmd_list() {
     label="$(echo "$row" | jq -r '.label')"
     created="$(echo "$row" | jq -r '.created')"
     uuid="$(echo "$row" | jq -r '.uuid')"
-    read -r xu xd <<<"$(xray_traffic_for_uuid "$uuid")"
-    read -r hu hd <<<"$(singbox_hy2_traffic_for_uuid "$uuid")"
-    printf "%-10s %-16s %-20s %-12s %-12s %-12s %-12s\n" \
-      "$tok" "$label" "$created" "$(format_bytes "$xu")" "$(format_bytes "$xd")" "$(format_bytes "$hu")" "$(format_bytes "$hd")"
+    if [[ "$uuid" == "null" || -z "$uuid" ]]; then
+      uuid="(缺失)"
+      xu=0
+      xd=0
+      hu=0
+      hd=0
+    else
+      read -r xu xd <<<"$(xray_traffic_for_uuid "$uuid")"
+      read -r hu hd <<<"$(singbox_hy2_traffic_for_uuid "$uuid")"
+    fi
+    printf "%-10s %-36s %-12s %-19s %-10s %-10s %-10s %-10s\n" \
+      "$tok" "$uuid" "$label" "$created" "$(format_bytes "$xu")" "$(format_bytes "$xd")" "$(format_bytes "$hu")" "$(format_bytes "$hd")"
   done < <(jq -c '.[]' "$TOKENS_JSON" 2>/dev/null)
+  echo ""
+  echo "提示: 原始 JSON 见 $TOKENS_JSON ，或 jq -r '.[] | [.token,.uuid] | @tsv' $TOKENS_JSON"
   echo ""
 }
 
