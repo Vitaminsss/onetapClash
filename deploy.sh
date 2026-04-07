@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # One-click deploy for Debian/Ubuntu: sub-api + nginx + certbot + systemd + vpn CLI
 
-# Strip Windows CRLF from this file before anything else runs
-# (safe to run multiple times; no-op if already LF)
 if grep -qU $'\r' "$0" 2>/dev/null; then
   sed -i 's/\r$//' "$0"
   exec bash "$0" "$@"
@@ -13,6 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUB_ROOT="/opt/sub-api"
 ENV_FILE="$SUB_ROOT/sub-api.env"
+XRAY_API_PORT_DEPLOY="${XRAY_API_PORT:-10085}"
 
 die() { echo "[deploy] error: $*" >&2; exit 1; }
 log() { echo "[deploy] $*" >&2; }
@@ -76,17 +75,12 @@ copy_payload() {
   mkdir -p "$SUB_ROOT"
   install -m0644 "$SCRIPT_DIR/app.py" "$SUB_ROOT/app.py"
   install -m0644 "$SCRIPT_DIR/requirements.txt" "$SUB_ROOT/requirements.txt"
-  install -m0644 "$SCRIPT_DIR/discover.py" "$SUB_ROOT/discover.py"
-  install -m0644 "$SCRIPT_DIR/nginx_patch_v2ray.py" "$SUB_ROOT/nginx_patch_v2ray.py"
-  install -m0755 "$SCRIPT_DIR/xray-hook.sh" "$SUB_ROOT/xray-hook.sh"
   install -m0755 "$SCRIPT_DIR/vpn" "/usr/local/bin/vpn"
-  # Strip Windows CRLF from all copied scripts/sources
+  install -m0755 "$SCRIPT_DIR/stop.sh" "/usr/local/bin/sub-api-stop"
   sed -i 's/\r$//' \
     "$SUB_ROOT/app.py" \
-    "$SUB_ROOT/discover.py" \
-    "$SUB_ROOT/nginx_patch_v2ray.py" \
-    "$SUB_ROOT/xray-hook.sh" \
-    "/usr/local/bin/vpn"
+    "/usr/local/bin/vpn" \
+    "/usr/local/bin/sub-api-stop"
   [[ -f "$SUB_ROOT/tokens.json" ]] || echo '[]' >"$SUB_ROOT/tokens.json"
   chmod 0640 "$SUB_ROOT/tokens.json" || true
 }
@@ -100,21 +94,268 @@ venv_install() {
   deactivate
 }
 
+# 与 discover.py 等价的 server.json（jq）
 build_server_json() {
   local domain="$1"
   local xray_cfg="$2"
   local sing_cfg="$3"
-  local args=("$domain")
-  [[ -n "$xray_cfg" && -f "$xray_cfg" ]] && args+=("$xray_cfg") || args+=("-")
-  [[ -n "$sing_cfg" && -f "$sing_cfg" ]] && args+=("$sing_cfg") || args+=("-")
-  python3 "$SUB_ROOT/discover.py" "${args[@]}" >"$SUB_ROOT/server.json"
+  local xj sj
+  if [[ -n "$xray_cfg" && -f "$xray_cfg" ]]; then
+    xj="$(jq -c . "$xray_cfg" 2>/dev/null || echo '{}')"
+  else
+    xj="{}"
+  fi
+  if [[ -n "$sing_cfg" && -f "$sing_cfg" ]]; then
+    sj="$(jq -c . "$sing_cfg" 2>/dev/null || echo '{}')"
+  else
+    sj="{}"
+  fi
+
+  jq -n \
+    --arg domain "$domain" \
+    --argjson xray "$xj" \
+    --argjson sing "$sj" \
+    '
+    def vless_defaults($d):
+      {
+        vless_tls: {port: 443, sni: $d, flow: "xtls-rprx-vision"},
+        vless_reality: {port: 8888, sni: $d, public_key: "", short_id: "", flow: "xtls-rprx-vision"}
+      };
+
+    ($xray | if type == "object" then . else {} end) as $X
+    | ($sing | if type == "object" then . else {} end) as $S
+    | (
+        if ($X | keys | length) == 0 then
+          vless_defaults($domain)
+        else
+          reduce ($X.inbounds // [])[] as $ib (
+            vless_defaults($domain);
+            if ($ib | type) != "object" or ($ib.protocol != "vless") then .
+            else
+              ($ib.streamSettings // {}) as $st
+              | (($st.security // "") | ascii_downcase) as $sec
+              | ($st.realitySettings // {}) as $re
+              | (if ($st.tlsSettings | type) == "object" then
+                   ($st.tlsSettings.serverName) as $sn
+                   | if ($sn | type) == "array" and ($sn | length) > 0 then $sn[0]
+                     elif ($sn | type) == "string" then $sn
+                     else null end
+                 else null end) as $sni
+              | if ($sec == "reality") or (($re | keys | length) > 0) then
+                  .vless_reality |= (
+                    (if $ib.port then .port = ($ib.port | tonumber) else . end)
+                    | (if ($re.serverNames | type) == "array" and ($re.serverNames | length) > 0
+                       then .sni = $re.serverNames[0] else . end)
+                    | (if $re.publicKey then .public_key = $re.publicKey
+                       elif $re.public_key then .public_key = $re.public_key else . end)
+                    | (if ($re.shortIds | type) == "array" and ($re.shortIds | length) > 0
+                       then .short_id = ($re.shortIds[0] | tostring)
+                       elif ($re.short_ids | type) == "array" and ($re.short_ids | length) > 0
+                       then .short_id = ($re.short_ids[0] | tostring)
+                       elif ($re.short_id | type) == "string"
+                       then .short_id = $re.short_id
+                       else . end)
+                  )
+                else
+                  .vless_tls |= (
+                    (if $ib.port then .port = ($ib.port | tonumber) else . end)
+                    | (if $sni != null and ($sni | tostring | length) > 0 then .sni = $sni else . end)
+                  )
+                end
+            end
+          )
+        end
+      ) as $vx
+    | (
+        if ($S | keys | length) == 0 then
+          {port: 9999, sni: $domain, alpn: ["h3"]}
+        else
+          ([$S | .. | objects | select(.type == "hysteria2")] | .[0]) as $h
+          | if $h == null then
+              {port: 8443, sni: $domain, alpn: ["h3"]}
+            else
+              {
+                port: (($h.listen_port // $h.port // 8443) | tonumber),
+                sni: (($h.tls // {}) | .server_name // $domain),
+                alpn: ($h.alpn // ["h3"])
+              }
+            end
+        end
+      ) as $hy
+    | {
+        domain: $domain,
+        vless_tls: $vx.vless_tls,
+        vless_reality: $vx.vless_reality,
+        hysteria2: $hy
+      }
+    ' >"$SUB_ROOT/server.json"
+}
+
+merge_xray_stats_deploy() {
+  local f="$1"
+  local port="$2"
+  [[ -f "$f" ]] || { log "Xray config not found: $f"; return 1; }
+  local tmp
+  tmp="$(mktemp)"
+  jq --argjson port "$port" '
+    .stats = (.stats // {})
+    | .api = (
+        if (.api | type) == "object" then
+          .api
+          | .listen = (.listen // "127.0.0.1")
+          | .port = ($port | tonumber)
+          | .services = (
+              (.services // []) as $s
+              | if ($s | index("StatsService")) then $s else $s + ["StatsService"] end
+              | if index("HandlerService") then . else . + ["HandlerService"] end
+            )
+        else
+          {
+            "tag": "api",
+            "listen": "127.0.0.1",
+            "port": ($port | tonumber),
+            "services": ["HandlerService", "StatsService"]
+          }
+        end
+      )
+    | .policy = (
+        (.policy // {}) as $p
+        | $p
+        | .levels = (
+            ($p.levels // {}) as $lv
+            | $lv
+            | .["0"] = (
+                ($lv["0"] // {}) as $z
+                | $z
+                | .statsUserUplink = true
+                | .statsUserDownlink = true
+              )
+          )
+      )
+  ' "$f" >"$tmp"
+  mv "$tmp" "$f"
 }
 
 inject_xray() {
-  # shellcheck disable=SC1090
-  source "$SUB_ROOT/xray-hook.sh"
+  local xray_cfg="${1:-}"
   export SUB_API_ENV="$ENV_FILE"
-  inject_stats_only || log "inject xray stats skipped (no xray config)"
+  [[ -n "$xray_cfg" && -f "$xray_cfg" ]] || { log "inject xray stats skipped (no xray config)"; return 0; }
+  merge_xray_stats_deploy "$xray_cfg" "$XRAY_API_PORT_DEPLOY" || log "inject xray stats failed"
+}
+
+reload_cores_deploy() {
+  for s in xray sing-box v2ray-agent; do
+    if systemctl is-active --quiet "$s" 2>/dev/null; then
+      log "restarting $s"
+      systemctl restart "$s" || true
+    fi
+  done
+}
+
+# 与旧版 nginx_patch_v2ray.py 行为一致（内联，不单独文件）
+patch_v2ray_nginx() {
+  python3 - <<'PY'
+import re
+import sys
+from pathlib import Path
+
+
+def _make_snippet(indent: str) -> str:
+    i = indent + "    "
+    return (
+        f"{indent}location /sub {{\n"
+        f"{i}proxy_pass http://127.0.0.1:8080;\n"
+        f"{i}proxy_set_header Host $host;\n"
+        f"{i}proxy_set_header X-Real-IP $remote_addr;\n"
+        f"{i}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        f"{i}proxy_set_header X-Forwarded-Proto $scheme;\n"
+        f"{indent}}}\n"
+        f"{indent}location /health {{\n"
+        f"{i}proxy_pass http://127.0.0.1:8080;\n"
+        f"{i}proxy_set_header Host $host;\n"
+        f"{indent}}}\n"
+    )
+
+
+def patch_alone_conf(text: str) -> tuple[str, bool]:
+    marker = "real_ip_header proxy_protocol"
+    if marker not in text:
+        return text, False
+
+    out = text
+    changed = False
+    search_from = 0
+    while True:
+        i = out.find(marker, search_from)
+        if i == -1:
+            break
+        sub = out[i:]
+        m = re.search(r"^(\s*)location /\s*\{\s*$", sub, re.MULTILINE)
+        if not m:
+            search_from = i + len(marker)
+            continue
+        rel_start = m.start()
+        j = i + rel_start
+        segment = out[i:j]
+        if "location /sub" in segment:
+            search_from = i + len(marker)
+            continue
+        indent = m.group(1)
+        snippet = _make_snippet(indent)
+        out = out[:j] + snippet + out[j:]
+        changed = True
+        search_from = j + len(snippet)
+
+    return out, changed
+
+
+def patch_subscribe_conf(text: str) -> tuple[str, bool]:
+    if "location /sub" in text:
+        return text, False
+
+    snippet = _make_snippet("    ")
+    mark = "location ~ ^/s/"
+    if mark in text:
+        idx = text.index(mark)
+        return text[:idx] + snippet + text[idx:], True
+    idx = text.find("    location / {")
+    if idx != -1:
+        return text[:idx] + snippet + text[idx:], True
+    return text, False
+
+
+def main() -> int:
+    alone = Path("/etc/nginx/conf.d/alone.conf")
+    sub = Path("/etc/nginx/conf.d/subscribe.conf")
+    any_change = False
+
+    if alone.is_file():
+        t = alone.read_text(encoding="utf-8")
+        new_t, ch = patch_alone_conf(t)
+        if ch:
+            alone.write_text(new_t, encoding="utf-8")
+            print(f"patched {alone}", file=sys.stderr)
+            any_change = True
+
+    if sub.is_file():
+        t = sub.read_text(encoding="utf-8")
+        new_t, ch = patch_subscribe_conf(t)
+        if ch:
+            sub.write_text(new_t, encoding="utf-8")
+            print(f"patched {sub}", file=sys.stderr)
+            any_change = True
+
+    if not alone.is_file() and not sub.is_file():
+        print("no alone.conf or subscribe.conf found", file=sys.stderr)
+        return 1
+
+    if not any_change:
+        print("already patched or nothing to do", file=sys.stderr)
+    return 0
+
+
+raise SystemExit(main())
+PY
 }
 
 write_systemd() {
@@ -144,7 +385,6 @@ EOF
 write_nginx_site() {
   local domain="$1"
   mkdir -p /var/www/html /etc/nginx/sites-available /etc/nginx/sites-enabled
-  # Ensure nginx.conf includes sites-enabled if it doesn't already
   if [[ -f /etc/nginx/nginx.conf ]] && ! grep -q 'sites-enabled' /etc/nginx/nginx.conf; then
     sed -i '/http {/a\\tinclude /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
   fi
@@ -172,14 +412,6 @@ EOF
   ln -sf /etc/nginx/sites-available/sub-api /etc/nginx/sites-enabled/sub-api
   nginx -t
   systemctl reload nginx
-}
-
-# v2ray-agent：443 经 Xray fallback 到 alone.conf（proxy_protocol）；35172 在 subscribe.conf。
-# 两处均需 /sub 反代，见 nginx_patch_v2ray.py。
-patch_v2ray_nginx() {
-  if [[ -f "$SUB_ROOT/nginx_patch_v2ray.py" ]]; then
-    python3 "$SUB_ROOT/nginx_patch_v2ray.py" || log "nginx v2ray 补丁跳过或已存在"
-  fi
 }
 
 run_certbot() {
@@ -211,7 +443,6 @@ main() {
   need_root
   stop_existing_services
   local domain="${1:-}"
-  # 可选：环境变量传邮箱给 certbot，例如 CERTBOT_EMAIL=you@example.com bash deploy.sh domain
   [[ -n "$domain" ]] || die "用法: sudo bash deploy.sh <your.domain.com>
   可选: CERTBOT_EMAIL=you@example.com sudo bash deploy.sh <your.domain.com>"
 
@@ -229,26 +460,23 @@ main() {
   write_env "$domain" "$xray_cfg" "$sing_cfg"
   build_server_json "$domain" "$xray_cfg" "$sing_cfg"
 
-  inject_xray
+  export SUB_API_ENV="$ENV_FILE"
+  inject_xray "$xray_cfg"
   if [[ -n "$xray_cfg" && -f "$xray_cfg" ]]; then
-    # shellcheck disable=SC1090
-    source "$SUB_ROOT/xray-hook.sh"
-    reload_cores || true
+    reload_cores_deploy
   fi
 
   write_systemd
   write_nginx_site "$domain"
   run_certbot "$domain"
-  patch_v2ray_nginx
+  patch_v2ray_nginx || log "nginx v2ray 补丁跳过或已存在"
   nginx -t && systemctl reload nginx
 
   export SUB_API_ENV="$ENV_FILE"
-  # shellcheck disable=SC1090
-  source "$SUB_ROOT/xray-hook.sh"
   log "创建首个订阅用户…"
   SUB_PUBLIC_DOMAIN="$domain" /usr/local/bin/vpn create "first-device" || true
 
-  log "完成。常用命令: vpn create / vpn list / vpn revoke <token>"
+  log "完成。常用命令: vpn create / vpn list / vpn revoke <token>；停止订阅服务: sudo sub-api-stop"
 }
 
 main "$@"
