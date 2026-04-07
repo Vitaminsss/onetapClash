@@ -6,12 +6,21 @@ set -euo pipefail
 [[ "${EUID:-0}" -eq 0 ]] || { echo "请用 root: sudo bash $0"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="/opt/sub-api/nginx_patch_v2ray.py"
-if [[ ! -f "$PY" ]]; then
-  PY="${SCRIPT_DIR}/nginx_patch_v2ray.py"
-fi
-[[ -f "$PY" ]] || { echo "未找到 nginx_patch_v2ray.py（请与脚本同目录或先运行 deploy.sh）"; exit 1; }
+PY_INSTALL="/opt/sub-api/nginx_patch_v2ray.py"
+PY_SRC="${SCRIPT_DIR}/nginx_patch_v2ray.py"
 
+mkdir -p /opt/sub-api
+if [[ ! -f "$PY_INSTALL" ]]; then
+  if [[ -f "$PY_SRC" ]]; then
+    install -m0644 "$PY_SRC" "$PY_INSTALL"
+    echo "已安装 $PY_INSTALL（来自脚本同目录）"
+  else
+    echo "缺少 $PY_INSTALL 且同目录无 nginx_patch_v2ray.py，请 git 拉最新或运行 deploy.sh"
+    exit 1
+  fi
+fi
+
+PY="$PY_INSTALL"
 sed -i 's/\r$//' "$PY" 2>/dev/null || true
 python3 "$PY"
 nginx -t

@@ -10,12 +10,22 @@
 单独修补（无需完整 deploy）：
 
 ```bash
+cd ~/dev/clash-sub-api   # 确保目录里有 nginx_patch_v2ray.py
 sudo bash patch-subscribe-nginx.sh
 ```
 
-或：
+`patch-subscribe-nginx.sh` 若发现 `/opt/sub-api/nginx_patch_v2ray.py` 不存在，会**从脚本同目录复制**到 `/opt/sub-api/` 再执行。
+
+若从未跑过新版 `deploy.sh`，也可手动安装一次：
 
 ```bash
+sudo install -m0644 nginx_patch_v2ray.py /opt/sub-api/nginx_patch_v2ray.py
 sudo python3 /opt/sub-api/nginx_patch_v2ray.py && sudo nginx -t && sudo systemctl reload nginx
+```
+
+或重新执行完整部署（会复制该文件）：
+
+```bash
+sudo bash deploy.sh vps.ooooxo.com
 ```
 
