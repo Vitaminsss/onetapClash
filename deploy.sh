@@ -161,6 +161,53 @@ EOF
   systemctl reload nginx
 }
 
+# v2ray-agent 的 subscribe.conf 常在非 80 端口（如 35172）终止 HTTPS，且不含 /sub → 外网访问 https 域名会 404。
+# 在已有 subscribe.conf 的 server 块内插入反代到 sub-api（幂等）。
+patch_v2ray_subscribe_conf() {
+  local domain="$1"
+  local f="/etc/nginx/conf.d/subscribe.conf"
+  [[ -f "$f" ]] || return 0
+  if grep -q 'location /sub' "$f" 2>/dev/null; then
+    log "subscribe.conf 已包含 /sub，跳过补丁"
+    return 0
+  fi
+  python3 - "$f" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+if "location /sub" in text:
+    sys.exit(0)
+snippet = """    location /sub {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location /health {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+    }
+"""
+# 插在 v2ray-agent 订阅路径之前，避免落到空的 location /
+mark = "location ~ ^/s/"
+if mark in text:
+    i = text.index(mark)
+    text = text[:i] + snippet + "\n" + text[i:]
+else:
+    i = text.find("    location / {")
+    if i != -1:
+        text = text[:i] + snippet + "\n" + text[i:]
+    else:
+        sys.stderr.write("patch subscribe.conf: 未找到插入点，请手动添加 /sub 反代\\n")
+        sys.exit(1)
+path.write_text(text, encoding="utf-8")
+PY
+  log "已向 subscribe.conf 注入 /sub → 127.0.0.1:8080"
+}
+
 run_certbot() {
   local domain="$1"
   local email="${CERTBOT_EMAIL:-}"
@@ -217,6 +264,8 @@ main() {
   write_systemd
   write_nginx_site "$domain"
   run_certbot "$domain"
+  patch_v2ray_subscribe_conf "$domain"
+  nginx -t && systemctl reload nginx
 
   export SUB_API_ENV="$ENV_FILE"
   # shellcheck disable=SC1090
