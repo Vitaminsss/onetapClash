@@ -626,7 +626,6 @@ set -euo pipefail
 
 ROOT="/opt/sub-api"
 ENV_FILE="$ROOT/sub-api.env"
-SERVER_JSON="$ROOT/server.json"
 TOKENS_JSON="$ROOT/tokens.json"
 
 # shellcheck disable=SC1090
@@ -639,51 +638,56 @@ XRAY_API_PORT="${XRAY_API_PORT:-10085}"
 die()  { echo "[vpn] error: $*" >&2; exit 1; }
 log()  { echo "[vpn] $*" >&2; }
 
-load_tokens() { jq -r . "$TOKENS_JSON" 2>/dev/null || echo '[]'; }
-save_tokens() { local t="$1"; echo "$t" | jq . >"$TOKENS_JSON"; chmod 0640 "$TOKENS_JSON"; }
+load_tokens() { jq -c . "$TOKENS_JSON" 2>/dev/null || echo '[]'; }
+save_tokens() { echo "$1" | jq . >"$TOKENS_JSON"; chmod 0640 "$TOKENS_JSON"; }
 
 gen_uuid()  { uuidgen | tr '[:upper:]' '[:lower:]'; }
 gen_token() { openssl rand -hex 20; }
 
+# 向单个 JSON 文件添加 VLESS 用户（幂等）
+_xray_add_to_file() {
+  local f="$1" uuid="$2"
+  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' \
+    "$f" >/dev/null 2>&1 || return 0
+  local tmp; tmp="$(mktemp)"
+  jq -M --arg uuid "$uuid" \
+    '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |= (
+       if . == null then [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
+       elif map(select(.id == $uuid)) | length > 0 then .
+       else . + [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
+       end
+     )' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
 # 向 Xray config 添加 VLESS 用户
 _xray_add_user() {
   local uuid="$1"
-  local _add_to_file() {
-    local f="$1"
-    jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' "$f" >/dev/null 2>&1 || return 0
-    local tmp; tmp="$(mktemp)"
-    jq -M \
-      --arg uuid "$uuid" \
-      '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |= (
-        if . == null then [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
-        elif map(select(.id == $uuid)) | length > 0 then .
-        else . + [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
-        end
-      )' "$f" > "$tmp" && mv "$tmp" "$f"
-  }
   if [[ -d "$XRAY_CFG" ]]; then
-    for f in "$XRAY_CFG"/*.json; do _add_to_file "$f"; done
+    for f in "$XRAY_CFG"/*.json; do _xray_add_to_file "$f" "$uuid"; done
   elif [[ -f "$XRAY_CFG" ]]; then
-    _add_to_file "$XRAY_CFG"
+    _xray_add_to_file "$XRAY_CFG" "$uuid"
   fi
 }
 
-# 向 Xray config 删除 VLESS 用户
+# 从单个 JSON 文件删除 VLESS 用户
+_xray_del_from_file() {
+  local f="$1" uuid="$2"
+  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' \
+    "$f" >/dev/null 2>&1 || return 0
+  local tmp; tmp="$(mktemp)"
+  jq -M --arg uuid "$uuid" \
+    '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |=
+       map(select(.id != $uuid))' \
+    "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# 从 Xray config 删除 VLESS 用户
 _xray_del_user() {
   local uuid="$1"
-  local _del_from_file() {
-    local f="$1"
-    jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' "$f" >/dev/null 2>&1 || return 0
-    local tmp; tmp="$(mktemp)"
-    jq -M \
-      --arg uuid "$uuid" \
-      '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |= map(select(.id != $uuid))' \
-      "$f" > "$tmp" && mv "$tmp" "$f"
-  }
   if [[ -d "$XRAY_CFG" ]]; then
-    for f in "$XRAY_CFG"/*.json; do _del_from_file "$f"; done
+    for f in "$XRAY_CFG"/*.json; do _xray_del_from_file "$f" "$uuid"; done
   elif [[ -f "$XRAY_CFG" ]]; then
-    _del_from_file "$XRAY_CFG"
+    _xray_del_from_file "$XRAY_CFG" "$uuid"
   fi
 }
 
