@@ -910,10 +910,8 @@ After=network.target
 Type=simple
 WorkingDirectory=${SUB_ROOT}
 EnvironmentFile=-${ENV_FILE}
-Environment=SUB_API_HOST=127.0.0.1
-Environment=SUB_API_PORT=8080
 Environment=SUB_ROOT=${SUB_ROOT}
-ExecStart=${SUB_ROOT}/venv/bin/python ${SUB_ROOT}/app.py
+ExecStart=${SUB_ROOT}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal
@@ -925,84 +923,149 @@ EOF
   systemctl daemon-reload
   systemctl enable sub-api
   systemctl restart sub-api
-  ok "sub-api 服务启动完成"
+
+  # 等待最多 12 秒确认 8080 端口真的在监听
+  local i=0
+  while [[ $i -lt 12 ]]; do
+    if ss -tlnp 2>/dev/null | grep -q ':8080 '; then
+      ok "sub-api 启动成功，8080 端口已监听"
+      return 0
+    fi
+    sleep 1; (( i++ ))
+  done
+  warn "sub-api 启动后 8080 端口未检测到 — 查看日志: journalctl -u sub-api -n 30"
 }
 
 # ─── 12. Nginx 配置 ───────────────────────────────────────────────────────────
-write_nginx() {
+# 生成 proxy_pass 片段（Python 写文件，避免 bash heredoc 转义地狱）
+_write_location_snippet() {
+  local dest_file="$1"
+  python3 - "$dest_file" <<'PY'
+import sys
+f = sys.argv[1]
+snippet = """    location /sub {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+    }
+    location /health {
+        proxy_pass       http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+    }
+"""
+open(f, "w").write(snippet)
+PY
+}
+
+# 检测当前 Nginx 是否已经代理了 /sub 到 8080
+_nginx_has_sub_proxy() {
+  nginx -T 2>/dev/null | grep -q "proxy_pass.*127.0.0.1:8080" && \
+  nginx -T 2>/dev/null | grep -q "location /sub"
+}
+
+# 修补单个 nginx conf 文件（幂等，用 Python 做插入避免 sed 转义问题）
+_patch_nginx_conf() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  grep -q "location /sub" "$f" && { log "$f 已有 /sub 配置"; return 0; }
+
+  # 写出 snippet 到临时文件
+  local snippet_file; snippet_file="$(mktemp)"
+  _write_location_snippet "$snippet_file"
+
+  python3 - "$f" "$snippet_file" <<'PY'
+import sys, re
+conf_path = sys.argv[1]
+snippet   = open(sys.argv[2]).read()
+text      = open(conf_path).read()
+
+# 在第一个 "location / {" 或 "location ~ ^/s/" 前插入
+markers = [r'^\s*location\s*/\s*\{', r'^\s*location\s*~\s*\^/s/']
+insert_pos = None
+for pat in markers:
+    m = re.search(pat, text, re.MULTILINE)
+    if m:
+        insert_pos = m.start()
+        break
+
+if insert_pos is None:
+    # 找不到 marker，插到最后一个 } 之前
+    insert_pos = text.rfind("}")
+    if insert_pos == -1:
+        print(f"[patch] cannot find insert point in {conf_path}", flush=True)
+        sys.exit(1)
+
+new_text = text[:insert_pos] + snippet + text[insert_pos:]
+open(conf_path, "w").write(new_text)
+print(f"[patch] patched {conf_path}", flush=True)
+PY
+  rm -f "$snippet_file"
+}
+
+# 核心函数：检测 nginx 场景并配置
+configure_nginx() {
   local domain="$1"
-  log "配置 Nginx…"
+  log "检测 Nginx 配置场景…"
+
+  # ── 场景A：v2ray-agent 的分片配置（conf.d/alone.conf 或 subscribe.conf）
+  local v2ray_nginx_patched=false
+  for cf in /etc/nginx/conf.d/alone.conf /etc/nginx/conf.d/subscribe.conf; do
+    if [[ -f "$cf" ]]; then
+      log "发现 v2ray-agent nginx 配置: $cf"
+      if _patch_nginx_conf "$cf"; then
+        v2ray_nginx_patched=true
+        ok "已修补: $cf"
+      fi
+    fi
+  done
+
+  if $v2ray_nginx_patched; then
+    nginx -t && systemctl reload nginx && ok "v2ray-agent nginx 修补并重载完成"
+    # v2ray-agent 场景下 certbot 证书已存在，不需要新建 server block
+    log "v2ray-agent 场景：跳过新建 server block，证书由 v2ray-agent 管理"
+    return 0
+  fi
+
+  # ── 场景B：纯净 nginx，新建 server block + certbot
+  log "未检测到 v2ray-agent nginx，新建独立站点配置…"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
 
   # 确保 nginx.conf 包含 sites-enabled
-  if grep -q 'include /etc/nginx/conf.d' /etc/nginx/nginx.conf 2>/dev/null \
-     && ! grep -q 'sites-enabled' /etc/nginx/nginx.conf; then
+  if ! grep -q 'sites-enabled' /etc/nginx/nginx.conf 2>/dev/null; then
     sed -i '/http {/a\\tinclude /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
   fi
 
-  # 写入站点配置（先 HTTP，certbot 后续改成 HTTPS）
-  cat >/etc/nginx/sites-available/sub-api <<EOF
-server {
+  python3 - "$domain" >/etc/nginx/sites-available/sub-api <<'PY'
+import sys
+d = sys.argv[1]
+print(f"""server {{
     listen 80;
     listen [::]:80;
-    server_name ${domain};
+    server_name {d};
     root /var/www/html;
-
-    location /.well-known/acme-challenge/ { }
-
-    location /sub {
+    location /.well-known/acme-challenge/ {{ }}
+    location /sub {{
         proxy_pass         http://127.0.0.1:8080;
-        proxy_set_header   Host              \$host;
-        proxy_set_header   X-Real-IP         \$remote_addr;
-        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
         proxy_read_timeout 30s;
-    }
-
-    location /health {
+    }}
+    location /health {{
         proxy_pass       http://127.0.0.1:8080;
-        proxy_set_header Host \$host;
-    }
-}
-EOF
+        proxy_set_header Host $host;
+    }}
+}}""")
+PY
   ln -sf /etc/nginx/sites-available/sub-api /etc/nginx/sites-enabled/sub-api
-  nginx -t && systemctl reload nginx
-  ok "Nginx 配置写入完成"
-}
+  nginx -t && systemctl reload nginx && ok "Nginx 站点配置写入完成"
 
-# 修补 v2ray-agent 已有 nginx conf（alone.conf / subscribe.conf）
-patch_v2ray_nginx() {
-  local patched=false
-
-  _patch_file() {
-    local f="$1" marker="$2"
-    [[ -f "$f" ]] || return 0
-    grep -q "location /sub" "$f" && { log "$f 已有 /sub，跳过"; return 0; }
-    local snippet
-    snippet='    location /sub {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-    location /health {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-    }'
-    # 在 marker 前插入
-    if grep -q "$marker" "$f"; then
-      sed -i "/${marker}/i\\${snippet}" "$f" 2>/dev/null || true
-      patched=true
-      log "已修补: $f"
-    fi
-  }
-
-  _patch_file /etc/nginx/conf.d/alone.conf     "location / {"
-  _patch_file /etc/nginx/conf.d/subscribe.conf "location ~ \^/s/"
-  _patch_file /etc/nginx/conf.d/subscribe.conf "location / {"
-
-  $patched && { nginx -t 2>/dev/null && systemctl reload nginx; ok "v2ray-agent nginx 修补完成"; } || true
+  # 申请证书
+  run_certbot "$domain"
 }
 
 # ─── 13. Let's Encrypt ───────────────────────────────────────────────────────
@@ -1114,10 +1177,8 @@ main() {
   # 配置系统服务
   write_systemd
 
-  # 配置 Nginx
-  write_nginx "$domain"
-  patch_v2ray_nginx || true
-  run_certbot "$domain"
+  # 配置 Nginx（自动检测 v2ray-agent 场景 vs 纯净场景）
+  configure_nginx "$domain"
 
   # 创建首个用户
   log "创建首个订阅用户…"
