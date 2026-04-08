@@ -2,7 +2,7 @@
 # =============================================================================
 #  VPN 一键部署  —  Hysteria2  &  Xray VLESS+Reality+uTLS
 #  支持：有域名（HTTPS订阅）/ 纯IP（HTTP订阅，自签证书）
-#  用法: sudo bash vpn-setup.sh
+#  用法: sudo bash deploy.sh
 # =============================================================================
 if grep -qU $'\r' "$0" 2>/dev/null; then
   sed -i 's/\r$//' "$0"; exec bash "$0" "$@"
@@ -31,7 +31,7 @@ hr()   { printf "${C}"; printf '%0.s-' {1..62}; printf "${N}\n"; }
 pause(){ read -rp "  按回车继续..." _p; }
 
 need_root(){
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请用 root 运行: sudo bash vpn-setup.sh"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请用 root 运行: sudo bash deploy.sh"
 }
 
 get_public_ip(){
@@ -152,8 +152,8 @@ _install_ip_mode(){
   _setup_nginx ip "$sub_port"
   _save_state_ip "$server_ip" "$hy2_port" "$sub_port"
 
-  # 先重建（空用户）HY2 配置再启动
-  _rebuild_hy2_config
+  _firewall_open_ports_ip "$hy2_port" "$sub_port"
+  _seed_first_user "my-device"
 
   log "启动服务..."
   systemctl enable hysteria2; systemctl restart hysteria2 || true
@@ -173,14 +173,10 @@ _install_ip_mode(){
 
   _check_api_health || true
   _wait_port "$sub_port" "Nginx(订阅)"
+  _connectivity_test || true
 
-  _firewall_open_ports_ip "$hy2_port" "$sub_port"
-
-  ok "安装完成！"
-  echo ""
-  read -rp "  用户备注 [默认 my-device]: " _note
-  [[ -z "$_note" ]] && _note="my-device"
-  create_user "$_note"
+  ok "安装完成！首个用户已创建 (备注: my-device)"
+  _print_subscription_url_for_first_user
   echo ""
   pause
 }
@@ -236,7 +232,8 @@ _install_domain_mode(){
   _setup_nginx domain "$domain"
   _save_state_domain "$domain" "$pub_ip" "$xray_port" "$hy2_port" "$dest" "$cert_mode"
 
-  _rebuild_hy2_config
+  _firewall_open_ports_domain "$hy2_port" "$xray_port"
+  _seed_first_user "my-device"
 
   log "启动服务..."
   for svc in xray hysteria2 sub-api nginx; do
@@ -252,14 +249,10 @@ _install_domain_mode(){
   done
 
   _check_api_health || true
+  _connectivity_test || true
 
-  _firewall_open_ports_domain "$hy2_port" "$xray_port"
-
-  ok "安装完成！"
-  echo ""
-  read -rp "  用户备注 [默认 my-device]: " _note
-  [[ -z "$_note" ]] && _note="my-device"
-  create_user "$_note"
+  ok "安装完成！首个用户已创建 (备注: my-device)"
+  _print_subscription_url_for_first_user
   echo ""
   pause
 }
@@ -535,13 +528,14 @@ _write_xray_config(){
   }
 }
 EOF
-  cat > /etc/systemd/system/xray.service <<'EOF'
+  cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Server
 After=network.target
 
 [Service]
 User=nobody
+Environment=XRAY_LOCATION_ASSET=/etc/xray
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -553,6 +547,16 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+  mkdir -p "$LDIR"
+  touch "$LDIR/xray.log" "$LDIR/xray-err.log" 2>/dev/null || true
+  chown -R nobody:nogroup "$LDIR" 2>/dev/null || chown -R nobody:nobody "$LDIR"
+  chmod 755 /etc/xray
+  chown nobody:nogroup "$XCFG" 2>/dev/null || chown nobody:nobody "$XCFG"
+  chmod 600 "$XCFG"
+  [[ -f /etc/xray/geoip.dat ]]   && chown nobody:nogroup /etc/xray/geoip.dat   2>/dev/null && chmod 644 /etc/xray/geoip.dat
+  [[ -f /etc/xray/geosite.dat ]] && chown nobody:nogroup /etc/xray/geosite.dat 2>/dev/null && chmod 644 /etc/xray/geosite.dat
+  log "校验 Xray 配置..."
+  "$XBIN" run -config "$XCFG" -test || die "Xray 配置校验失败（见上）"
   systemctl daemon-reload
   ok "Xray Reality 配置完成"
 }
@@ -572,18 +576,22 @@ _rebuild_hy2_config(){
     userpass_block+="    ${uuid}: ${uuid}"$'\n'
   done < <(jq -r '.[].uuid' "$TFILE" 2>/dev/null || true)
 
-  local masquerade_block
-  if [[ "$mode" == "ip" ]]; then
-    masquerade_block='masquerade:
+  # 域名模式不再用 proxy 反代自身 HTTPS（易自签失败/回环）；与 IP 模式统一 string
+  local masquerade_block='masquerade:
   type: string
   string:
     content: "OK"'
+
+  local auth_yaml
+  if [[ -z "$(jq -r '.[].uuid' "$TFILE" 2>/dev/null | head -1)" ]]; then
+    auth_yaml="auth:
+  type: userpass
+  userpass: {}"
   else
-    masquerade_block="masquerade:
-  type: proxy
-  proxy:
-    url: https://${host}
-    rewriteHost: true"
+    auth_yaml="auth:
+  type: userpass
+  userpass:
+${userpass_block}"
   fi
 
   mkdir -p /etc/hysteria
@@ -594,10 +602,7 @@ tls:
   cert: /etc/ssl/vpn/cert.pem
   key:  /etc/ssl/vpn/key.pem
 
-auth:
-  type: userpass
-  userpass:
-${userpass_block}
+${auth_yaml}
 ${masquerade_block}
 
 bandwidth:
@@ -1031,6 +1036,137 @@ _check_api_health(){
   return 1
 }
 
+# ── 安装阶段：首个用户（仅写配置，不重启服务；供启动前写入 HY2/Xray）────────
+_seed_first_user(){
+  local note="${1:-my-device}"
+  [[ -f "$SFILE" ]] || die "_seed_first_user: 未找到 state.json"
+  log "创建首个用户 (备注: ${note})..."
+  local uuid token now tokens
+  uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  token="$(openssl rand -hex 24)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tokens="$(cat "$TFILE")"
+  tokens="$(echo "$tokens" | jq \
+    --arg tok "$token" --arg uuid "$uuid" \
+    --arg note "$note" --arg ts "$now" \
+    '. + [{token:$tok, uuid:$uuid, note:$note, created:$ts}]')"
+  echo "$tokens" > "$TFILE"
+  chmod 640 "$TFILE"
+
+  local mode
+  mode="$(jq -r '.mode' "$SFILE")"
+  if [[ "$mode" == "domain" && -f "$XCFG" ]]; then
+    local tmp; tmp="$(mktemp)"
+    jq --arg uuid "$uuid" \
+      '.inbounds[0].settings.clients += [{"id":$uuid,"email":$uuid,"flow":"xtls-rprx-vision"}]' \
+      "$XCFG" > "$tmp" && mv "$tmp" "$XCFG"
+    chown nobody:nogroup "$XCFG" 2>/dev/null || chown nobody:nobody "$XCFG"
+    chmod 600 "$XCFG"
+  fi
+  _rebuild_hy2_config
+  ok "首个用户 UUID 已写入 Hysteria2 / Xray(域名模式)"
+}
+
+_print_subscription_url_for_first_user(){
+  [[ -f "$SFILE" && -f "$TFILE" ]] || return 0
+  local mode host tok
+  mode="$(jq -r '.mode' "$SFILE")"
+  host="$(jq -r '.host' "$SFILE")"
+  tok="$(jq -r '.[0].token // empty' "$TFILE")"
+  [[ -n "$tok" ]] || { warn "无 token，无法显示订阅 URL"; return 0; }
+  echo ""
+  echo -e "  ${G}+------------------------------------------------------+${N}"
+  echo -e "  ${G}|  订阅 URL（已填入首个用户 token）                    |${N}"
+  echo -e "  ${G}+------------------------------------------------------+${N}"
+  if [[ "$mode" == "ip" ]]; then
+    local sp; sp="$(jq -r '.sub_port' "$SFILE")"
+    echo -e "  ${B}http://${host}:${sp}/sub?token=${tok}${N}"
+  else
+    echo -e "  ${B}https://${host}/sub?token=${tok}${N}"
+  fi
+  echo -e "  ${G}+------------------------------------------------------+${N}"
+}
+
+# ── 安装结束：本机连通性自检 ─────────────────────────────────────────────────
+_connectivity_test(){
+  [[ -f "$SFILE" ]] || { warn "无 state.json，跳过自检"; return 1; }
+  local mode hy2_port xray_port sub_port host fail=0
+  mode="$(jq -r '.mode' "$SFILE")"
+  hy2_port="$(jq -r '.hy2_port' "$SFILE")"
+  host="$(jq -r '.host' "$SFILE")"
+  hr
+  log "连通性自检（本机；外网 UDP/TCP 需在云安全组放行）"
+  echo ""
+
+  if systemctl is-active --quiet hysteria2; then
+    ok "PASS: hysteria2.service 运行中"
+  else
+    warn "FAIL: hysteria2 未运行 — journalctl -u hysteria2 -n 40"
+    fail=1
+  fi
+
+  if systemctl is-active --quiet sub-api; then
+    ok "PASS: sub-api.service 运行中"
+  else
+    warn "FAIL: sub-api 未运行 — journalctl -u sub-api -n 40"
+    fail=1
+  fi
+
+  if systemctl is-active --quiet nginx; then
+    ok "PASS: nginx 运行中"
+  else
+    warn "FAIL: nginx 未运行 — journalctl -u nginx -n 40"
+    fail=1
+  fi
+
+  if [[ "$mode" == "domain" ]]; then
+    xray_port="$(jq -r '.xray_port' "$SFILE")"
+    if systemctl is-active --quiet xray; then
+      ok "PASS: xray.service 运行中"
+    else
+      warn "FAIL: xray 未运行 — journalctl -u xray -n 40"
+      fail=1
+    fi
+    if ss -tlnp 2>/dev/null | grep -q ":${xray_port} "; then
+      ok "PASS: Xray TCP 端口 ${xray_port} 正在监听"
+    else
+      warn "FAIL: 未检测到 TCP :${xray_port} — ss -tlnp"
+      fail=1
+    fi
+  fi
+
+  if ss -ulnp 2>/dev/null | grep -q ":${hy2_port} "; then
+    ok "PASS: Hysteria2 UDP 端口 ${hy2_port} 正在监听"
+  else
+    warn "FAIL: 未检测到 UDP :${hy2_port} — ss -ulnp"
+    fail=1
+  fi
+
+  if curl -sf --max-time 5 http://127.0.0.1:8080/health >/dev/null; then
+    ok "PASS: GET http://127.0.0.1:8080/health"
+  else
+    warn "FAIL: 本机无法访问 sub-api — curl http://127.0.0.1:8080/health"
+    fail=1
+  fi
+
+  local tok
+  tok="$(jq -r '.[0].token // empty' "$TFILE" 2>/dev/null)"
+  if [[ -n "$tok" ]] && curl -sf --max-time 10 "http://127.0.0.1:8080/sub?token=${tok}" | grep -q 'proxies:'; then
+    ok "PASS: /sub 返回 YAML（含 proxies）"
+  else
+    warn "FAIL: /sub 无有效 YAML — curl -s \"http://127.0.0.1:8080/sub?token=...\""
+    fail=1
+  fi
+
+  if [[ "$fail" -eq 0 ]]; then
+    ok "自检全部通过（外网连通仍需放行安全组 UDP ${hy2_port} 等）"
+  else
+    warn "自检有失败项，请根据上述 FAIL 排查后再用客户端连接"
+  fi
+  hr
+  return "$fail"
+}
+
 # ── 保存状态 ──────────────────────────────────────────────────────────────────
 _save_state_ip(){
   local ip="$1" hy2_port="$2" sub_port="$3"
@@ -1097,6 +1233,8 @@ create_user(){
     jq --arg uuid "$uuid" \
       '.inbounds[0].settings.clients += [{"id":$uuid,"email":$uuid,"flow":"xtls-rprx-vision"}]' \
       "$XCFG" > "$tmp" && mv "$tmp" "$XCFG"
+    chown nobody:nogroup "$XCFG" 2>/dev/null || chown nobody:nobody "$XCFG"
+    chmod 600 "$XCFG"
     systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true
   fi
 
@@ -1209,6 +1347,8 @@ revoke_user(){
     jq --arg uuid "$found_uuid" \
       '.inbounds[0].settings.clients = [.inbounds[0].settings.clients[] | select(.id != $uuid)]' \
       "$XCFG" > "$tmp" && mv "$tmp" "$XCFG"
+    chown nobody:nogroup "$XCFG" 2>/dev/null || chown nobody:nobody "$XCFG"
+    chmod 600 "$XCFG"
     systemctl reload xray 2>/dev/null || true
   fi
 
