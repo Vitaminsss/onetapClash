@@ -149,6 +149,7 @@ _install_ip_mode(){
   _gen_self_signed_cert_ip "$server_ip"
   _write_hy2_systemd
   _setup_sub_api_ipmode "$server_ip" "$hy2_port" "$sub_port"
+  _setup_nginx ip "$sub_port"
   _save_state_ip "$server_ip" "$hy2_port" "$sub_port"
 
   # 先重建（空用户）HY2 配置再启动
@@ -157,6 +158,7 @@ _install_ip_mode(){
   log "启动服务..."
   systemctl enable hysteria2; systemctl restart hysteria2 || true
   systemctl enable sub-api;   systemctl restart sub-api   || true
+  systemctl enable nginx;     systemctl restart nginx     || true
   sleep 2
 
   systemctl is-active --quiet hysteria2 \
@@ -165,8 +167,12 @@ _install_ip_mode(){
   systemctl is-active --quiet sub-api \
     && ok "订阅API 运行中" \
     || warn "订阅API 异常: journalctl -u sub-api -n 30"
+  systemctl is-active --quiet nginx \
+    && ok "Nginx 运行中" \
+    || warn "Nginx 异常: journalctl -u nginx -n 30"
 
-  _wait_port "$sub_port" "订阅API"
+  _check_api_health || true
+  _wait_port "$sub_port" "Nginx(订阅)"
 
   ok "安装完成！"
   echo ""
@@ -225,7 +231,7 @@ _install_domain_mode(){
   _write_xray_config "$domain" "$xray_port" "$dest"
   _write_hy2_systemd
   _setup_sub_api_domain "$domain" "$xray_port" "$hy2_port" "$cert_mode"
-  _setup_nginx "$domain"
+  _setup_nginx domain "$domain"
   _save_state_domain "$domain" "$pub_ip" "$xray_port" "$hy2_port" "$dest" "$cert_mode"
 
   _rebuild_hy2_config
@@ -242,6 +248,8 @@ _install_domain_mode(){
       && ok "$svc 运行中" \
       || warn "$svc 异常: journalctl -u $svc -n 20"
   done
+
+  _check_api_health || true
 
   ok "安装完成！"
   echo ""
@@ -558,7 +566,7 @@ After=network.target
 WorkingDirectory=${SCFG}
 Environment=PFILE=${PFILE}
 Environment=TFILE=${TFILE}
-ExecStart=${SCFG}/venv/bin/gunicorn --bind 0.0.0.0:${sub_port} --workers 2 --timeout 30 app:app
+ExecStart=${SCFG}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
 Restart=always
 RestartSec=3
 
@@ -786,17 +794,20 @@ if __name__ == "__main__":
 PYEOF
 }
 
-# ── Nginx（域名模式）─────────────────────────────────────────────────────────
+# ── Nginx：domain = 监听 80 反代 8080；ip = 监听 sub_port 反代 8080 ────────────
 _setup_nginx(){
-  local domain="$1"
-  log "配置 Nginx..."
+  local mode="${1:?}"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
   if ! grep -q 'sites-enabled' /etc/nginx/nginx.conf 2>/dev/null; then
     sed -i '/http {/a\\tinclude /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
   fi
   rm -f /etc/nginx/sites-enabled/default
 
-  cat > /etc/nginx/sites-available/vpn-sub <<EOF
+  if [[ "$mode" == "domain" ]]; then
+    local domain="$2"
+    [[ -n "$domain" ]] || die "Nginx domain 模式需要域名参数"
+    log "配置 Nginx (域名 ${domain} → 127.0.0.1:8080)..."
+    cat > /etc/nginx/sites-available/vpn-sub <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -815,9 +826,52 @@ server {
     location / { return 444; }
 }
 EOF
+  elif [[ "$mode" == "ip" ]]; then
+    local sub_port="$2"
+    [[ -n "$sub_port" ]] || die "Nginx ip 模式需要订阅端口参数"
+    log "配置 Nginx (监听 ${sub_port} → 127.0.0.1:8080)..."
+    cat > /etc/nginx/sites-available/vpn-sub <<EOF
+server {
+    listen ${sub_port};
+    listen [::]:${sub_port};
+    server_name _;
+    root /var/www/html;
+    location /sub {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 30s;
+    }
+    location /health { proxy_pass http://127.0.0.1:8080; }
+    location / { return 444; }
+}
+EOF
+  else
+    die "未知 Nginx 模式: ${mode}（使用 domain 或 ip）"
+  fi
+
   ln -sf /etc/nginx/sites-available/vpn-sub /etc/nginx/sites-enabled/vpn-sub
-  nginx -t && systemctl reload nginx
+  nginx -t && systemctl enable nginx && systemctl restart nginx
   ok "Nginx 配置完成"
+}
+
+# ── 订阅 API 健康检查（gunicorn 监听 127.0.0.1:8080）────────────────────────
+_check_api_health(){
+  local i
+  log "检查订阅 API (GET http://127.0.0.1:8080/health)..."
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+      ok "订阅 API 健康检查通过"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "订阅 API 健康检查失败: curl http://127.0.0.1:8080/health"
+  warn "sub-api 最近日志:"
+  journalctl -u sub-api -n 30 --no-pager 2>/dev/null || true
+  return 1
 }
 
 # ── 保存状态 ──────────────────────────────────────────────────────────────────
