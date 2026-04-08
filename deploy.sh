@@ -653,15 +653,18 @@ def find_token(tok):
 def build_yaml(p, entry):
     host       = p["host"]
     uuid       = entry["uuid"]
-    note       = entry.get("note", uuid[:8])
     hy2_port   = p.get("hy2_port", 8443)
     skip_tls   = p.get("skip_tls", False)
     xray_en    = p.get("xray_enabled", False)
 
-    n_hy2 = note + " HY2"
-    # Hysteria2 block
+    # 固定展示名（与 Clash Verge 参考配置一致，不随用户备注变化）
+    NAME_H2 = "🚀 Hysteria2 极速"
+    NAME_VLESS = "🌐 VLESS Reality"
+    GROUP_MANUAL = "🔧 手动选择"
+    GROUP_MEDIA = "📺 流媒体"
+
     hy2_block = (
-        f"  - name: \"{n_hy2}\"\n"
+        f"  - name: {NAME_H2}\n"
         f"    type: hysteria2\n"
         f"    server: {host}\n"
         f"    port: {hy2_port}\n"
@@ -674,17 +677,15 @@ def build_yaml(p, entry):
     )
 
     proxy_blocks = [hy2_block]
-    proxy_names  = [n_hy2]
+    proxy_names  = [NAME_H2]
 
-    # Xray Reality block (domain mode only)
     if xray_en:
         xray_port = p.get("xray_port", 443)
         pubkey    = p.get("xray_pubkey",   "")
         short_id  = p.get("xray_short_id", "")
         dest      = p.get("xray_dest", "www.apple.com")
-        n_vless   = note + " Reality"
         vless_block = (
-            f"  - name: \"{n_vless}\"\n"
+            f"  - name: {NAME_VLESS}\n"
             f"    type: vless\n"
             f"    server: {host}\n"
             f"    port: {xray_port}\n"
@@ -700,26 +701,22 @@ def build_yaml(p, entry):
             f"      short-id: {short_id}"
         )
         proxy_blocks.append(vless_block)
-        proxy_names.append(n_vless)
+        proxy_names.append(NAME_VLESS)
 
     proxies_yaml = "\n\n".join(proxy_blocks)
-    names_yaml   = "\n".join(f"      - \"{n}\"" for n in proxy_names)
-    sel  = note + " Manual"
-    auto = note + " Auto"
+    names_yaml = "\n".join(f"      - {n}" for n in proxy_names)
 
     return (
         f"proxies:\n{proxies_yaml}\n\n"
         f"proxy-groups:\n"
-        f"  - name: \"{sel}\"\n"
+        f"  - name: {GROUP_MANUAL}\n"
         f"    type: select\n"
         f"    proxies:\n{names_yaml}\n"
         f"      - DIRECT\n\n"
-        f"  - name: \"{auto}\"\n"
-        f"    type: url-test\n"
-        f"    url: http://www.gstatic.com/generate_204\n"
-        f"    interval: 300\n"
-        f"    tolerance: 50\n"
-        f"    proxies:\n{names_yaml}\n\n"
+        f"  - name: {GROUP_MEDIA}\n"
+        f"    type: select\n"
+        f"    proxies:\n{names_yaml}\n"
+        f"      - DIRECT\n\n"
         f"dns:\n"
         f"  enable: true\n"
         f"  listen: 0.0.0.0:1053\n"
@@ -744,6 +741,14 @@ def build_yaml(p, entry):
         f"  - IP-CIDR,127.0.0.0/8,DIRECT\n"
         f"  - IP-CIDR,192.168.0.0/16,DIRECT\n"
         f"  - IP-CIDR,10.0.0.0/8,DIRECT\n"
+        f"  - DOMAIN-SUFFIX,netflix.com,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,nflxvideo.net,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,youtube.com,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,googlevideo.com,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,spotify.com,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,twitch.tv,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,tiktok.com,{GROUP_MEDIA}\n"
+        f"  - DOMAIN-SUFFIX,instagram.com,{GROUP_MEDIA}\n"
         f"  - DOMAIN-SUFFIX,baidu.com,DIRECT\n"
         f"  - DOMAIN-SUFFIX,qq.com,DIRECT\n"
         f"  - DOMAIN-SUFFIX,wechat.com,DIRECT\n"
@@ -765,7 +770,7 @@ def build_yaml(p, entry):
         f"  - DOMAIN-SUFFIX,huawei.com,DIRECT\n"
         f"  - DOMAIN-SUFFIX,bytedance.com,DIRECT\n"
         f"  - GEOIP,CN,DIRECT\n"
-        f"  - MATCH,\"{sel}\"\n"
+        f"  - MATCH,{NAME_H2}\n"
     )
 
 @app.get("/sub")
