@@ -555,7 +555,11 @@ _setup_sub_api_ipmode(){
 
   _write_app_py
   python3 -m venv "$SCFG/venv"
-  "$SCFG/venv/bin/pip" install flask gunicorn --quiet
+  "$SCFG/venv/bin/pip" install -U pip setuptools wheel --quiet
+  "$SCFG/venv/bin/pip" install flask gunicorn --quiet \
+    || die "pip 安装 flask/gunicorn 失败，请检查网络与磁盘空间"
+  "$SCFG/venv/bin/python" -m py_compile "$SCFG/app.py" \
+    || die "app.py 语法检查失败"
 
   cat > /etc/systemd/system/sub-api.service <<EOF
 [Unit]
@@ -563,10 +567,12 @@ Description=VPN Subscription API
 After=network.target
 
 [Service]
+Type=simple
 WorkingDirectory=${SCFG}
 Environment=PFILE=${PFILE}
 Environment=TFILE=${TFILE}
-ExecStart=${SCFG}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${SCFG}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 120 app:app
 Restart=always
 RestartSec=3
 
@@ -603,7 +609,11 @@ _setup_sub_api_domain(){
 
   _write_app_py
   python3 -m venv "$SCFG/venv"
-  "$SCFG/venv/bin/pip" install flask gunicorn --quiet
+  "$SCFG/venv/bin/pip" install -U pip setuptools wheel --quiet
+  "$SCFG/venv/bin/pip" install flask gunicorn --quiet \
+    || die "pip 安装 flask/gunicorn 失败，请检查网络与磁盘空间"
+  "$SCFG/venv/bin/python" -m py_compile "$SCFG/app.py" \
+    || die "app.py 语法检查失败"
 
   cat > /etc/systemd/system/sub-api.service <<EOF
 [Unit]
@@ -611,10 +621,12 @@ Description=VPN Subscription API
 After=network.target
 
 [Service]
+Type=simple
 WorkingDirectory=${SCFG}
 Environment=PFILE=${PFILE}
 Environment=TFILE=${TFILE}
-ExecStart=${SCFG}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${SCFG}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 120 app:app
 Restart=always
 RestartSec=3
 
@@ -783,11 +795,10 @@ def sub():
         abort(403)
     p    = load_params()
     yaml = build_yaml(p, entry)
-    fn   = "clash-" + entry.get("note", "sub").replace(" ", "-") + ".yaml"
     return Response(
         yaml,
-        mimetype="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{fn}"'}
+        mimetype="text/yaml; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="clash-subscription.yaml"'},
     )
 
 @app.get("/health")
@@ -821,16 +832,73 @@ server {
     location /.well-known/acme-challenge/ { }
     location /sub {
         proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
         proxy_set_header   Host              \$host;
         proxy_set_header   X-Real-IP         \$remote_addr;
         proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 30s;
+        proxy_set_header   Connection        "";
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
     }
-    location /health { proxy_pass http://127.0.0.1:8080; }
+    location /health {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
     location / { return 444; }
 }
 EOF
+    local ssl_chain="" ssl_key=""
+    if [[ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" && -f "/etc/letsencrypt/live/${domain}/privkey.pem" ]]; then
+      ssl_chain="/etc/letsencrypt/live/${domain}/fullchain.pem"
+      ssl_key="/etc/letsencrypt/live/${domain}/privkey.pem"
+      ok "检测到 Let's Encrypt 证书，增加 HTTPS(443) 反代"
+    elif [[ -f /etc/ssl/vpn/cert.pem && -f /etc/ssl/vpn/key.pem ]]; then
+      ssl_chain="/etc/ssl/vpn/cert.pem"
+      ssl_key="/etc/ssl/vpn/key.pem"
+      ok "检测到自签证书，增加 HTTPS(443) 反代（浏览器会提示不安全）"
+    fi
+    if [[ -n "$ssl_chain" ]]; then
+      cat >> /etc/nginx/sites-available/vpn-sub <<EOF
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${domain};
+    ssl_certificate     ${ssl_chain};
+    ssl_certificate_key ${ssl_key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    root /var/www/html;
+    location /.well-known/acme-challenge/ { }
+    location /sub {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   Connection        "";
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
+    }
+    location /health {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
+    location / { return 444; }
+}
+EOF
+    fi
   elif [[ "$mode" == "ip" ]]; then
     local sub_port="$2"
     [[ -n "$sub_port" ]] || die "Nginx ip 模式需要订阅端口参数"
@@ -843,13 +911,24 @@ server {
     root /var/www/html;
     location /sub {
         proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
         proxy_set_header   Host              \$host;
         proxy_set_header   X-Real-IP         \$remote_addr;
         proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 30s;
+        proxy_set_header   Connection        "";
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
     }
-    location /health { proxy_pass http://127.0.0.1:8080; }
+    location /health {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+    }
     location / { return 444; }
 }
 EOF
