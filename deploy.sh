@@ -1,1240 +1,1069 @@
 #!/usr/bin/env bash
 # =============================================================================
-# clash-sub-api  ·  一键部署脚本  ·  完全自包含版本
-# 用法: sudo bash deploy.sh <your.domain.com>
-#       CERTBOT_EMAIL=you@example.com sudo bash deploy.sh <your.domain.com>
+#  VPN 一键部署脚本  —  Xray VLESS+Reality+uTLS  &  Hysteria2
+#  含订阅 API（Clash Meta YAML）、用户管理、卸载
+#  用法: sudo bash vpn-setup.sh
 # =============================================================================
-# 功能:
-#   1. 自动探测 Xray / sing-box 配置（单文件 & 分片目录）
-#   2. 提取 VLESS+REALITY / VLESS+TLS / Hysteria2 参数生成 server.json
-#   3. 注入 Xray stats + api + routing rule（幂等）
-#   4. 部署 Flask 订阅 API（app.py 内联生成）
-#   5. 配置 Nginx + Let's Encrypt HTTPS
-#   6. 安装 vpn CLI（内联生成，无外部依赖）
-#   7. 创建首个订阅用户
-# =============================================================================
-
 # CRLF 自修复
 if grep -qU $'\r' "$0" 2>/dev/null; then
   sed -i 's/\r$//' "$0"; exec bash "$0" "$@"
 fi
 
 set -euo pipefail
-IFS=$'\n\t'
 
-# ─── 全局常量 ─────────────────────────────────────────────────────────────────
-SUB_ROOT="/opt/sub-api"
-ENV_FILE="$SUB_ROOT/sub-api.env"
-SERVER_JSON="$SUB_ROOT/server.json"
-TOKENS_JSON="$SUB_ROOT/tokens.json"
-XRAY_API_PORT="${XRAY_API_PORT:-10085}"
-XRAY_API_TAG="api"
+# ─── 常量 ────────────────────────────────────────────────────────────────────
+INSTALL_DIR="/opt/vpn-stack"
+XRAY_DIR="/usr/local/bin"
+XRAY_CONF="/etc/xray"
+HY2_CONF="/etc/hysteria"
+SUB_DIR="$INSTALL_DIR/sub-api"
+STATE_FILE="$INSTALL_DIR/state.json"
+TOKENS_FILE="$INSTALL_DIR/tokens.json"
+LOG_DIR="/var/log/vpn-stack"
 
-# ─── 工具函数 ─────────────────────────────────────────────────────────────────
-log()  { echo -e "\033[36m[deploy]\033[0m $*" >&2; }
-ok()   { echo -e "\033[32m[  OK  ]\033[0m $*" >&2; }
-warn() { echo -e "\033[33m[ WARN ]\033[0m $*" >&2; }
-die()  { echo -e "\033[31m[ ERR  ]\033[0m $*" >&2; exit 1; }
+# ─── 颜色 ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+log()  { echo -e "${CYAN}[*]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[✓]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[!]${RESET} $*"; }
+err()  { echo -e "${RED}[✗]${RESET} $*" >&2; }
+die()  { err "$*"; exit 1; }
+hr()   { echo -e "${CYAN}$(printf '─%.0s' {1..60})${RESET}"; }
 
 need_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请使用 root 运行: sudo bash deploy.sh <域名>"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "请用 root 运行: sudo bash vpn-setup.sh"
 }
 
-require_domain() {
-  local domain="${1:-}"
-  [[ -n "$domain" ]] || die "用法: sudo bash deploy.sh <your.domain.com>
-可选: CERTBOT_EMAIL=you@example.com sudo bash deploy.sh <your.domain.com>"
-  # 基本格式验证
-  # 基本格式验证（含多级子域名）
-  [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] \
-    || warn "域名格式疑似不对，请确认: $domain"
-  echo "$domain"
+# ─── 主菜单 ──────────────────────────────────────────────────────────────────
+main_menu() {
+  while true; do
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║        VPN 一键管理面板                  ║"
+    echo "  ║   Xray Reality + Hysteria2 + 订阅API     ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo -e "${RESET}"
+
+    local installed=false
+    [[ -f "$STATE_FILE" ]] && installed=true
+
+    if $installed; then
+      local domain; domain="$(jq -r '.domain' "$STATE_FILE" 2>/dev/null || echo '未知')"
+      echo -e "  ${GREEN}● 已安装${RESET}  域名: ${BOLD}${domain}${RESET}"
+    else
+      echo -e "  ${YELLOW}● 未安装${RESET}"
+    fi
+    hr
+    echo "  1) 安装 / 重新部署"
+    echo "  2) 用户管理（新建 / 列表 / 吊销）"
+    echo "  3) 查看服务状态"
+    echo "  4) 查看节点信息 & 订阅链接"
+    echo "  5) 重启所有服务"
+    echo "  6) 卸载（删除所有）"
+    echo "  0) 退出"
+    hr
+    read -rp "  请选择 [0-6]: " choice
+    case "$choice" in
+      1) do_install ;;
+      2) user_menu ;;
+      3) show_status ;;
+      4) show_node_info ;;
+      5) restart_all ;;
+      6) do_uninstall ;;
+      0) echo "再见！"; exit 0 ;;
+      *) warn "无效选项，请重试" ; sleep 1 ;;
+    esac
+  done
 }
 
-# ─── 1. 依赖安装 ──────────────────────────────────────────────────────────────
-install_packages() {
-  log "安装依赖包…"
+# ─── 安装流程 ─────────────────────────────────────────────────────────────────
+do_install() {
+  clear
+  echo -e "${BOLD}=== 安装向导 ===${RESET}"
+  hr
+
+  # ── 收集参数 ──────────────────────────────────────────────────────────────
+  echo ""
+  echo -e "${BOLD}【1/4】基础信息${RESET}"
+
+  # 自动获取公网 IP
+  local server_ip
+  server_ip="$(curl -s4 --max-time 5 ip.sb || curl -s4 --max-time 5 ifconfig.me || true)"
+  echo -e "  检测到服务器 IP: ${GREEN}${server_ip}${RESET}"
+
+  local domain=""
+  while [[ -z "$domain" ]]; do
+    read -rp "  请输入你的域名（已解析到本机）: " domain
+    domain="${domain// /}"
+    [[ -z "$domain" ]] && warn "域名不能为空"
+  done
+
+  echo ""
+  echo -e "${BOLD}【2/4】端口配置${RESET}（直接回车使用默认值）"
+  local xray_port hy2_port sub_port
+  read -rp "  Xray Reality 端口 [默认随机 10000-60000]: " xray_port
+  [[ -z "$xray_port" ]] && xray_port=$(( RANDOM % 50000 + 10000 ))
+  read -rp "  Hysteria2 端口 [默认随机 10000-60000]: " hy2_port
+  [[ -z "$hy2_port" ]] && hy2_port=$(( RANDOM % 50000 + 10000 ))
+  # 确保两个端口不一样
+  while [[ "$hy2_port" == "$xray_port" ]]; do
+    hy2_port=$(( RANDOM % 50000 + 10000 ))
+  done
+  sub_port=8080  # 订阅 API 只监听 127.0.0.1
+
+  echo ""
+  echo -e "${BOLD}【3/4】Reality 伪装配置${RESET}"
+  echo "  Reality 需要一个可被访问的 TLS 网站作为伪装目标"
+  echo "  推荐: www.apple.com / dl.google.com / addons.mozilla.org"
+  local reality_dest
+  read -rp "  伪装域名 [默认 www.apple.com]: " reality_dest
+  [[ -z "$reality_dest" ]] && reality_dest="www.apple.com"
+
+  echo ""
+  echo -e "${BOLD}【4/4】Hysteria2 密码 & 证书${RESET}"
+  echo "  Hysteria2 需要 TLS 证书。选择方式："
+  echo "  1) 自动申请 Let's Encrypt（需要 80 端口未被占用）"
+  echo "  2) 自签名证书（客户端需开 skip-cert-verify）"
+  local cert_mode
+  read -rp "  选择 [1/2，默认1]: " cert_mode
+  [[ -z "$cert_mode" ]] && cert_mode=1
+
+  echo ""
+  echo -e "  ${YELLOW}确认参数：${RESET}"
+  echo "  域名        : $domain"
+  echo "  服务器IP    : $server_ip"
+  echo "  Xray 端口   : $xray_port"
+  echo "  Hysteria2   : $hy2_port"
+  echo "  Reality 伪装: $reality_dest"
+  echo "  证书方式    : $([ "$cert_mode" = "1" ] && echo "Let's Encrypt" || echo "自签名")"
+  echo ""
+  read -rp "  确认开始安装？[Y/n]: " confirm
+  [[ "${confirm,,}" == "n" ]] && return
+
+  # ── 开始安装 ──────────────────────────────────────────────────────────────
+  hr
+  log "开始安装..."
+
+  _install_packages
+  _install_xray
+  _install_hysteria2
+  _setup_certs "$domain" "$cert_mode"
+  _configure_xray "$domain" "$xray_port" "$reality_dest"
+  _configure_hysteria2 "$domain" "$hy2_port"
+  _setup_sub_api "$domain" "$xray_port" "$hy2_port"
+  _setup_nginx "$domain"
+  _save_state "$domain" "$server_ip" "$xray_port" "$hy2_port" "$reality_dest" "$cert_mode"
+  _start_services
+
+  ok "安装完成！"
+  echo ""
+  echo -e "  ${GREEN}创建第一个订阅用户：${RESET}"
+  local first_note
+  read -rp "  用户备注 [默认: my-device]: " first_note
+  [[ -z "$first_note" ]] && first_note="my-device"
+  _create_user "$first_note"
+
+  echo ""
+  read -rp "按回车返回主菜单..." _
+}
+
+# ─── 安装依赖 ─────────────────────────────────────────────────────────────────
+_install_packages() {
+  log "安装系统依赖..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y -qq
+  apt-get update -qq
   apt-get install -y -qq \
+    curl wget unzip jq openssl uuid-runtime \
+    nginx certbot python3-certbot-nginx \
     python3 python3-venv python3-pip \
-    jq curl wget nginx \
-    certbot python3-certbot-nginx \
-    openssl uuid-runtime \
-    2>&1 | tail -5
-  ok "依赖安装完成"
+    net-tools iproute2 \
+    2>&1 | grep -E "^(Err|W:)" || true
+  ok "系统依赖安装完成"
 }
 
-# ─── 2. 探测 Xray / sing-box 配置路径 ────────────────────────────────────────
-# 返回格式: "xray_path|singbox_path"  （路径可为空）
-discover_configs() {
-  local xray_path="" sing_path=""
+# ─── 安装 Xray ────────────────────────────────────────────────────────────────
+_install_xray() {
+  log "下载安装 Xray..."
+  mkdir -p "$XRAY_CONF" "$LOG_DIR"
 
-  # Xray: 优先单文件，再找分片目录
-  local xray_candidates=(
-    /usr/local/etc/xray/config.json
-    /etc/xray/config.json
-    /etc/v2ray-agent/xray/conf/config.json
-    /etc/v2ray-agent/xray/config.json
-  )
-  local xray_dir_candidates=(
-    /etc/v2ray-agent/xray/conf
-    /usr/local/etc/xray/conf
-    /usr/local/etc/xray
-  )
+  # 获取最新版本号
+  local xray_ver
+  xray_ver="$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+    | jq -r '.tag_name' 2>/dev/null || echo "v25.3.6")"
 
-  for c in "${xray_candidates[@]}"; do
-    if [[ -f "$c" ]] && jq -e '.inbounds // .outbounds' "$c" >/dev/null 2>&1; then
-      xray_path="$c"; break
-    fi
-  done
-  if [[ -z "$xray_path" ]]; then
-    for d in "${xray_dir_candidates[@]}"; do
-      if [[ -d "$d" ]] && ls "$d"/*.json >/dev/null 2>&1; then
-        # 验证目录里有 vless inbound
-        local combined
-        combined="$(jq -sc '[.[].inbounds? // [] | .[]]' "$d"/*.json 2>/dev/null || echo '[]')"
-        if echo "$combined" | jq -e '[.[] | select(.protocol=="vless")] | length > 0' >/dev/null 2>&1; then
-          xray_path="$d"; break
-        fi
-      fi
-    done
-  fi
+  local arch
+  case "$(uname -m)" in
+    x86_64)  arch="64" ;;
+    aarch64) arch="arm64-v8a" ;;
+    armv7l)  arch="arm32-v7a" ;;
+    *)       arch="64" ;;
+  esac
 
-  # sing-box
-  local sing_candidates=(
-    /usr/local/etc/sing-box/config.json
-    /etc/sing-box/config.json
-    /etc/v2ray-agent/sing-box/conf/config.json
-    /etc/v2ray-agent/sing-box/config.json
-  )
-  for c in "${sing_candidates[@]}"; do
-    if [[ -f "$c" ]] && jq -e '.inbounds // .outbounds' "$c" >/dev/null 2>&1; then
-      sing_path="$c"; break
-    fi
-  done
+  local url="https://github.com/XTLS/Xray-core/releases/download/${xray_ver}/Xray-linux-${arch}.zip"
+  local tmp_dir; tmp_dir="$(mktemp -d)"
 
-  [[ -n "$xray_path" ]] && log "发现 Xray 配置: $xray_path" || warn "未找到 Xray 配置"
-  [[ -n "$sing_path" ]] && log "发现 sing-box 配置: $sing_path" || warn "未找到 sing-box 配置"
+  curl -sL "$url" -o "$tmp_dir/xray.zip" || die "Xray 下载失败，请检查网络"
+  unzip -q "$tmp_dir/xray.zip" -d "$tmp_dir/xray"
+  install -m0755 "$tmp_dir/xray/xray" "$XRAY_DIR/xray"
+  rm -rf "$tmp_dir"
 
-  echo "${xray_path}|${sing_path}"
+  # 下载 geoip / geosite
+  curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" \
+    -o "$XRAY_CONF/geoip.dat" || warn "geoip.dat 下载失败（可选）"
+  curl -sL "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" \
+    -o "$XRAY_CONF/geosite.dat" || warn "geosite.dat 下载失败（可选）"
+
+  ok "Xray ${xray_ver} 安装完成"
 }
 
-# ─── 3. 解析配置 → server.json ────────────────────────────────────────────────
-# 把 Xray/sing-box 配置里的端口/密钥提取成统一的 server.json
-build_server_json() {
-  local domain="$1" xray_path="$2" sing_path="$3"
-  log "解析协议参数 → $SERVER_JSON"
-  mkdir -p "$SUB_ROOT"
+# ─── 安装 Hysteria2 ──────────────────────────────────────────────────────────
+_install_hysteria2() {
+  log "下载安装 Hysteria2..."
+  mkdir -p "$HY2_CONF" "$LOG_DIR"
 
-  # 合并 Xray inbounds（单文件或分片目录）
-  local xray_inbounds='[]'
-  if [[ -d "$xray_path" ]]; then
-    xray_inbounds="$(jq -sc '[.[].inbounds? // [] | .[]]' "$xray_path"/*.json 2>/dev/null || echo '[]')"
-  elif [[ -f "$xray_path" ]]; then
-    xray_inbounds="$(jq -c '.inbounds // []' "$xray_path" 2>/dev/null || echo '[]')"
-  fi
+  local hy2_ver
+  hy2_ver="$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
+    | jq -r '.tag_name' 2>/dev/null || echo "app/v2.6.1")"
+  # 版本号去掉前缀 "app/"
+  local ver_num="${hy2_ver#app/}"
 
-  # 解析 VLESS inbounds
-  local vless_reality_port=8888 vless_reality_sni="$domain"
-  local vless_reality_pubkey="" vless_reality_shortid="" vless_reality_flow="xtls-rprx-vision"
-  local vless_tls_port=443 vless_tls_sni="$domain" vless_tls_flow="xtls-rprx-vision"
-  local found_reality=false found_tls=false
+  local arch
+  case "$(uname -m)" in
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    armv7l)  arch="armv7" ;;
+    *)       arch="amd64" ;;
+  esac
 
-  # 用 jq 逐个 inbound 解析
-  local parsed_reality parsed_tls
-  parsed_reality="$(echo "$xray_inbounds" | jq -c '
-    [ .[] | select(.protocol == "vless")
-      | select(
-          (.streamSettings.security == "reality") or
-          ((.streamSettings.realitySettings | type) == "object" and
-           (.streamSettings.realitySettings | keys | length) > 0)
-        )
-    ] | .[0] // null
-  ')"
-  parsed_tls="$(echo "$xray_inbounds" | jq -c '
-    [ .[] | select(.protocol == "vless")
-      | select(
-          (.streamSettings.security == "tls") or
-          (.streamSettings.security == "")  or
-          (.streamSettings.security == null)
-        )
-      | select(
-          (.streamSettings.realitySettings | type) != "object" or
-          (.streamSettings.realitySettings | keys | length) == 0
-        )
-    ] | .[0] // null
-  ')"
+  local url="https://github.com/apernet/hysteria/releases/download/${hy2_ver}/hysteria-linux-${arch}"
+  curl -sL "$url" -o /usr/local/bin/hysteria || die "Hysteria2 下载失败"
+  chmod +x /usr/local/bin/hysteria
 
-  if [[ "$parsed_reality" != "null" && -n "$parsed_reality" ]]; then
-    found_reality=true
-    vless_reality_port="$(echo "$parsed_reality" | jq -r '.port // 8888')"
-    local re_settings
-    re_settings="$(echo "$parsed_reality" | jq -c '.streamSettings.realitySettings // {}')"
-    # serverNames
-    local sni_val
-    sni_val="$(echo "$re_settings" | jq -r '
-      if (.serverNames | type) == "array" and (.serverNames | length) > 0 then .serverNames[0]
-      elif (.dest | type) == "string" and (.dest | length) > 0 then .dest | split(":")[0]
-      else ""
-      end
-    ')"
-    [[ -n "$sni_val" && "$sni_val" != "null" ]] && vless_reality_sni="$sni_val"
-    # publicKey
-    local pk
-    pk="$(echo "$re_settings" | jq -r '.publicKey // .public_key // ""')"
-    [[ -n "$pk" && "$pk" != "null" ]] && vless_reality_pubkey="$pk"
-    # shortId
-    local sid
-    sid="$(echo "$re_settings" | jq -r '
-      if (.shortIds | type) == "array" and (.shortIds | length) > 0 then .shortIds[0]
-      elif (.shortId | type) == "string" and (.shortId | length) > 0 then .shortId
-      elif (.short_ids | type) == "array" then .short_ids[0]
-      elif (.short_id | type) == "string" then .short_id
-      else ""
-      end
-    ')"
-    [[ -n "$sid" && "$sid" != "null" ]] && vless_reality_shortid="$sid"
-    ok "VLESS+REALITY: port=$vless_reality_port sni=$vless_reality_sni pk=${vless_reality_pubkey:0:16}…"
-  fi
+  ok "Hysteria2 ${ver_num} 安装完成"
+}
 
-  if [[ "$parsed_tls" != "null" && -n "$parsed_tls" ]]; then
-    found_tls=true
-    vless_tls_port="$(echo "$parsed_tls" | jq -r '.port // 443')"
-    local tls_sni
-    tls_sni="$(echo "$parsed_tls" | jq -r '
-      .streamSettings.tlsSettings.serverName
-      // (.streamSettings.tlsSettings.serverNames // [] | .[0])
-      // ""
-    ')"
-    [[ -n "$tls_sni" && "$tls_sni" != "null" ]] && vless_tls_sni="$tls_sni"
-    ok "VLESS+TLS: port=$vless_tls_port sni=$vless_tls_sni"
-  fi
+# ─── 证书处理 ─────────────────────────────────────────────────────────────────
+_setup_certs() {
+  local domain="$1" mode="$2"
+  log "配置 TLS 证书..."
+  mkdir -p "/etc/ssl/vpn"
 
-  # 解析 Hysteria2 (sing-box)
-  local hy2_port=8443 hy2_sni="$domain" hy2_alpn='["h3"]'
-  if [[ -f "$sing_path" ]]; then
-    local hy2_ib
-    hy2_ib="$(jq -c '[.. | objects | select(.type == "hysteria2")] | .[0] // null' "$sing_path" 2>/dev/null || echo 'null')"
-    if [[ "$hy2_ib" != "null" && -n "$hy2_ib" ]]; then
-      hy2_port="$(echo "$hy2_ib" | jq -r '.listen_port // .port // 8443')"
-      local h2_sni
-      h2_sni="$(echo "$hy2_ib" | jq -r '.tls.server_name // ""')"
-      [[ -n "$h2_sni" && "$h2_sni" != "null" ]] && hy2_sni="$h2_sni"
-      local h2_alpn
-      h2_alpn="$(echo "$hy2_ib" | jq -c '.tls.alpn // ["h3"]' 2>/dev/null || echo '["h3"]')"
-      hy2_alpn="$h2_alpn"
-      ok "Hysteria2: port=$hy2_port sni=$hy2_sni"
-    fi
-  fi
-
-  # 写入 server.json
-  jq -n \
-    --arg domain "$domain" \
-    --argjson vless_reality_port "$vless_reality_port" \
-    --arg vless_reality_sni "$vless_reality_sni" \
-    --arg vless_reality_pubkey "$vless_reality_pubkey" \
-    --arg vless_reality_shortid "$vless_reality_shortid" \
-    --arg vless_reality_flow "$vless_reality_flow" \
-    --argjson vless_tls_port "$vless_tls_port" \
-    --arg vless_tls_sni "$vless_tls_sni" \
-    --arg vless_tls_flow "$vless_tls_flow" \
-    --argjson hy2_port "$hy2_port" \
-    --arg hy2_sni "$hy2_sni" \
-    --argjson hy2_alpn "$hy2_alpn" \
-    --argjson found_reality "$found_reality" \
-    --argjson found_tls "$found_tls" \
-    '{
-      domain: $domain,
-      vless_reality: {
-        port: $vless_reality_port,
-        sni: $vless_reality_sni,
-        public_key: $vless_reality_pubkey,
-        short_id: $vless_reality_shortid,
-        flow: $vless_reality_flow
-      },
-      vless_tls: {
-        port: $vless_tls_port,
-        sni: $vless_tls_sni,
-        flow: $vless_tls_flow
-      },
-      hysteria2: {
-        port: $hy2_port,
-        sni: $hy2_sni,
-        alpn: $hy2_alpn
-      },
-      meta: {
-        has_reality: $found_reality,
-        has_tls: $found_tls,
-        has_hysteria2: true
+  if [[ "$mode" == "1" ]]; then
+    # Let's Encrypt — 先确保 nginx 在跑
+    systemctl start nginx 2>/dev/null || true
+    certbot certonly --nginx -d "$domain" \
+      --non-interactive --agree-tos \
+      --register-unsafely-without-email \
+      --quiet || {
+        warn "Let's Encrypt 失败，改用自签名证书"
+        _gen_self_signed "$domain"
+        return
       }
-    }' > "$SERVER_JSON"
-  ok "server.json 写入完成"
-}
-
-# ─── 4. 注入 Xray Stats + API（幂等）────────────────────────────────────────
-# 对单个 JSON 文件执行注入（幂等，使用临时文件防止写坏）
-_inject_stats_file() {
-  local f="$1"
-  # 只处理含 vless inbound 的文件
-  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' "$f" >/dev/null 2>&1 || return 0
-
-  local tmp
-  tmp="$(mktemp)"
-  # shellcheck disable=SC2064
-  trap "rm -f '$tmp'" RETURN
-
-  jq -M \
-    --arg api_tag "$XRAY_API_TAG" \
-    --argjson api_port "$XRAY_API_PORT" \
-    '
-    # stats 对象（无内容，但必须存在）
-    .stats = (.stats // {})
-    # api inbound on loopback grpc
-    | .api = (
-        if (.api | type) == "object" then
-          .api
-          | .tag = ($api_tag)
-          | .services = (
-              (.services // []) as $s
-              | if ($s | map(select(. == "StatsService")) | length) > 0 then $s
-                else $s + ["StatsService"] end
-              | if (map(select(. == "HandlerService")) | length) > 0 then .
-                else . + ["HandlerService"] end
-            )
-        else
-          {tag: $api_tag, services: ["HandlerService", "StatsService"]}
-        end
-      )
-    # policy: 开启用户粒度统计
-    | .policy.levels."0".statsUserUplink = true
-    | .policy.levels."0".statsUserDownlink = true
-    | .policy.system.statsInboundUplink = true
-    | .policy.system.statsInboundDownlink = true
-    # routing: 注入 api inbound tag（幂等）
-    | .routing = (
-        (.routing // {rules: []}) as $r
-        | $r
-        | .rules = (
-            ($r.rules // []) as $rules
-            | if ($rules | map(select(.outboundTag == $api_tag)) | length) > 0
-              then $rules
-              else [{
-                type: "field",
-                inboundTag: [$api_tag],
-                outboundTag: $api_tag
-              }] + $rules
-              end
-          )
-      )
-    ' "$f" >"$tmp" \
-    && mv "$tmp" "$f" \
-    || { warn "stats 注入失败: $f"; return 1; }
-}
-
-# 注入 api inbound（分离到独立文件，v2ray-agent 分片目录专用）
-_ensure_api_inbound_file() {
-  local dir="$1"
-  local api_file="$dir/10_api.json"
-  # 检查是否已有 api inbound
-  if grep -rl "\"tag\":\"${XRAY_API_TAG}\"" "$dir"/ >/dev/null 2>&1 \
-     || grep -rl "\"tag\": \"${XRAY_API_TAG}\"" "$dir"/ >/dev/null 2>&1; then
-    return 0
+    # 软链到统一路径
+    ln -sf "/etc/letsencrypt/live/${domain}/fullchain.pem" "/etc/ssl/vpn/cert.pem"
+    ln -sf "/etc/letsencrypt/live/${domain}/privkey.pem"   "/etc/ssl/vpn/key.pem"
+    ok "Let's Encrypt 证书获取成功"
+  else
+    _gen_self_signed "$domain"
   fi
-  log "写入分片 API inbound: $api_file"
+}
+
+_gen_self_signed() {
+  local domain="$1"
+  log "生成自签名证书..."
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+    -keyout /etc/ssl/vpn/key.pem \
+    -out    /etc/ssl/vpn/cert.pem \
+    -days 3650 -nodes \
+    -subj "/CN=${domain}" \
+    -addext "subjectAltName=DNS:${domain}" \
+    2>/dev/null
+  ok "自签名证书生成完成（有效期 10 年）"
+}
+
+# ─── 配置 Xray ────────────────────────────────────────────────────────────────
+_configure_xray() {
+  local domain="$1" port="$2" dest="$3"
+  log "生成 Xray Reality 配置..."
+
+  # 生成 Reality 密钥对
+  local keypair; keypair="$($XRAY_DIR/xray x25519 2>/dev/null)"
+  local privkey; privkey="$(echo "$keypair" | awk '/Private key:/{print $3}')"
+  local pubkey;  pubkey="$(echo  "$keypair" | awk '/Public key:/{print $3}')"
+  local short_id; short_id="$(openssl rand -hex 4)"
+
+  # 保存密钥供后续使用
+  mkdir -p "$INSTALL_DIR"
   jq -n \
-    --arg tag "$XRAY_API_TAG" \
-    --argjson port "$XRAY_API_PORT" \
-    '{
-      inbounds: [{
-        tag: $tag,
-        port: $port,
-        listen: "127.0.0.1",
-        protocol: "dokodemo-door",
-        settings: {address: "127.0.0.1"}
-      }]
-    }' > "$api_file"
+    --arg privkey "$privkey" --arg pubkey "$pubkey" \
+    --arg short_id "$short_id" --arg port "$port" \
+    --arg dest "$dest" --arg domain "$domain" \
+    '{xray_reality_privkey: $privkey, xray_reality_pubkey: $pubkey,
+      xray_reality_short_id: $short_id, xray_port: ($port|tonumber),
+      xray_dest: $dest, domain: $domain}' > "$INSTALL_DIR/xray-params.json"
+
+  cat > "$XRAY_CONF/config.json" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "${LOG_DIR}/xray-access.log",
+    "error":  "${LOG_DIR}/xray-error.log"
+  },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": ["HandlerService", "StatsService"]
+  },
+  "policy": {
+    "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
+    "system": {"statsInboundUplink": true, "statsInboundDownlink": true}
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${dest}:443",
+          "xver": 0,
+          "serverNames": ["${dest}"],
+          "privateKey": "${privkey}",
+          "shortIds": ["${short_id}"]
+        }
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "tag": "api",
+      "port": 10085,
+      "listen": "127.0.0.1",
+      "protocol": "dokodemo-door",
+      "settings": {"address": "127.0.0.1"}
+    }
+  ],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block",  "protocol": "blackhole"}
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}
+    ]
+  }
 }
-
-inject_xray_stats() {
-  local xray_path="$1"
-  [[ -n "$xray_path" ]] || { warn "无 Xray 配置，跳过 stats 注入"; return 0; }
-
-  log "注入 Xray stats/api…"
-  if [[ -d "$xray_path" ]]; then
-    _ensure_api_inbound_file "$xray_path"
-    for f in "$xray_path"/*.json; do
-      _inject_stats_file "$f" 2>/dev/null || true
-    done
-  elif [[ -f "$xray_path" ]]; then
-    # 单文件：确保有 api inbound（直接塞进 inbounds 数组）
-    local tmp; tmp="$(mktemp)"
-    trap "rm -f '$tmp'" RETURN
-    jq -M \
-      --arg tag "$XRAY_API_TAG" \
-      --argjson port "$XRAY_API_PORT" \
-      '
-      if ([ .inbounds? // [] | .[] | select(.tag == $tag)] | length) == 0 then
-        .inbounds = (.inbounds // []) + [{
-          tag: $tag,
-          port: $port,
-          listen: "127.0.0.1",
-          protocol: "dokodemo-door",
-          settings: {address: "127.0.0.1"}
-        }]
-      else . end
-      ' "$xray_path" > "$tmp" && mv "$tmp" "$xray_path"
-    _inject_stats_file "$xray_path" 2>/dev/null || true
-  fi
-  ok "Xray stats 注入完成（API port: $XRAY_API_PORT）"
-}
-
-# ─── 5. 写入 sub-api.env ──────────────────────────────────────────────────────
-write_env() {
-  local domain="$1" xray_path="$2" sing_path="$3"
-  mkdir -p "$SUB_ROOT"
-  cat >"$ENV_FILE" <<EOF
-# Managed by deploy.sh — do not hand-edit, re-run deploy.sh to regenerate
-SUB_PUBLIC_DOMAIN=${domain}
-SUB_API_ENV=${ENV_FILE}
-XRAY_CONFIG=${xray_path}
-SINGBOX_CONFIG=${sing_path}
-XRAY_API_PORT=${XRAY_API_PORT}
-# 若 sing-box 开启了 Clash API 填入，例: http://127.0.0.1:9191
-SINGBOX_CLASH_API=
 EOF
-  ok "sub-api.env 写入完成"
+
+  # systemd 服务
+  cat > /etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable xray
+  ok "Xray 配置完成  pubkey=${pubkey}  short_id=${short_id}"
 }
 
-# ─── 6. 生成 app.py（Flask 订阅服务）────────────────────────────────────────
-write_app_py() {
-  log "生成 app.py..."
-  cat >"$SUB_ROOT/app.py" <<'PYEOF'
+# ─── 配置 Hysteria2 ──────────────────────────────────────────────────────────
+_configure_hysteria2() {
+  local domain="$1" port="$2"
+  log "生成 Hysteria2 配置..."
+
+  # 保存 hy2 参数
+  local params; params="$(cat "$INSTALL_DIR/xray-params.json")"
+  echo "$params" | jq --arg hy2_port "$port" '. + {hy2_port: ($hy2_port|tonumber)}' \
+    > "$INSTALL_DIR/xray-params.json.tmp"
+  mv "$INSTALL_DIR/xray-params.json.tmp" "$INSTALL_DIR/xray-params.json"
+
+  cat > "$HY2_CONF/config.yaml" <<EOF
+listen: :${port}
+
+tls:
+  cert: /etc/ssl/vpn/cert.pem
+  key:  /etc/ssl/vpn/key.pem
+
+auth:
+  type: password
+  password: PLACEHOLDER_WILL_BE_REPLACED
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${domain}
+    rewriteHost: true
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+EOF
+
+  # systemd 服务
+  cat > /etc/systemd/system/hysteria2.service <<'EOF'
+[Unit]
+Description=Hysteria2 Service
+After=network.target
+
+[Service]
+User=nobody
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable hysteria2
+  ok "Hysteria2 配置完成"
+}
+
+# ─── 订阅 API ─────────────────────────────────────────────────────────────────
+_setup_sub_api() {
+  local domain="$1" xray_port="$2" hy2_port="$3"
+  log "部署订阅 API..."
+  mkdir -p "$SUB_DIR"
+  [[ -f "$TOKENS_FILE" ]] || echo '[]' > "$TOKENS_FILE"
+  chmod 640 "$TOKENS_FILE"
+
+  # ── app.py ──────────────────────────────────────────────────────────────
+  cat > "$SUB_DIR/app.py" <<'PYEOF'
 #!/usr/bin/env python3
 import json, os, time
 from pathlib import Path
 from flask import Flask, request, Response, abort
 
-ROOT        = Path(os.environ.get("SUB_ROOT", "/opt/sub-api"))
-SERVER_JSON = ROOT / "server.json"
-TOKENS_JSON = ROOT / "tokens.json"
+INSTALL_DIR = Path(os.environ.get("INSTALL_DIR", "/opt/vpn-stack"))
+PARAMS_FILE = INSTALL_DIR / "xray-params.json"
+TOKENS_FILE = INSTALL_DIR / "tokens.json"
 app = Flask(__name__)
 
-def load_server():
-    return json.loads(SERVER_JSON.read_text())
+def load_params():
+    return json.loads(PARAMS_FILE.read_text())
 
 def load_tokens():
-    try:
-        return json.loads(TOKENS_JSON.read_text())
-    except Exception:
-        return []
+    try: return json.loads(TOKENS_FILE.read_text())
+    except: return []
 
 def find_token(token):
     for t in load_tokens():
-        if t.get("token") == token:
-            return t
+        if t.get("token") == token: return t
     return None
 
-def build_proxies(srv, uuid, note):
-    domain  = srv["domain"]
-    reality = srv.get("vless_reality", {})
-    tls_cfg = srv.get("vless_tls",    {})
-    hy2     = srv.get("hysteria2",    {})
-    meta    = srv.get("meta",         {})
-    blocks, names = [], []
+def build_yaml(params, entry):
+    domain   = params["domain"]
+    uuid     = entry["uuid"]
+    note     = entry.get("note", uuid[:8])
+    xp       = params.get("xray_port", 443)
+    hy2p     = params.get("hy2_port", 8443)
+    pubkey   = params.get("xray_reality_pubkey", "")
+    short_id = params.get("xray_reality_short_id", "")
+    dest     = params.get("xray_dest", "www.apple.com")
+    skip_tls = params.get("cert_mode", "1") != "1"
 
-    # Hysteria2 (fastest, first)
-    if hy2.get("port"):
-        n = "\U0001f680 " + note + " Hysteria2"
-        alpn_yaml = "\n".join("      - " + a for a in hy2.get("alpn", ["h3"]))
-        blocks.append(
-            "  - name: " + n + "\n"
-            "    type: hysteria2\n"
-            "    server: " + domain + "\n"
-            "    port: " + str(hy2["port"]) + "\n"
-            "    password: " + uuid + "\n"
-            "    sni: " + hy2.get("sni", domain) + "\n"
-            "    skip-cert-verify: false\n"
-            "    udp: true\n"
-            "    alpn:\n" + alpn_yaml
-        )
-        names.append(n)
+    n_hy2     = f"\U0001f680 {note} \u00b7 HY2"
+    n_reality = f"\U0001f512 {note} \u00b7 Reality"
 
-    # VLESS + REALITY
-    if meta.get("has_reality") and reality.get("public_key"):
-        n = "\U0001f512 " + note + " VLESS-Reality"
-        blocks.append(
-            "  - name: " + n + "\n"
-            "    type: vless\n"
-            "    server: " + domain + "\n"
-            "    port: " + str(reality["port"]) + "\n"
-            "    uuid: " + uuid + "\n"
-            "    network: tcp\n"
-            "    tls: true\n"
-            "    udp: true\n"
-            "    flow: " + reality.get("flow", "xtls-rprx-vision") + "\n"
-            "    servername: " + reality.get("sni", domain) + "\n"
-            "    reality-opts:\n"
-            "      public-key: " + reality["public_key"] + "\n"
-            "      short-id: " + reality.get("short_id", "") + "\n"
-            "    client-fingerprint: chrome"
-        )
-        names.append(n)
+    proxies = (
+        f"  - name: \"{n_hy2}\"\n"
+        f"    type: hysteria2\n"
+        f"    server: {domain}\n"
+        f"    port: {hy2p}\n"
+        f"    password: {uuid}\n"
+        f"    sni: {domain}\n"
+        f"    skip-cert-verify: {'true' if skip_tls else 'false'}\n"
+        f"    udp: true\n"
+        f"    alpn:\n"
+        f"      - h3\n"
+        f"\n"
+        f"  - name: \"{n_reality}\"\n"
+        f"    type: vless\n"
+        f"    server: {domain}\n"
+        f"    port: {xp}\n"
+        f"    uuid: {uuid}\n"
+        f"    network: tcp\n"
+        f"    tls: true\n"
+        f"    udp: true\n"
+        f"    flow: xtls-rprx-vision\n"
+        f"    servername: {dest}\n"
+        f"    client-fingerprint: chrome\n"
+        f"    reality-opts:\n"
+        f"      public-key: {pubkey}\n"
+        f"      short-id: {short_id}"
+    )
 
-    # VLESS + TLS
-    if meta.get("has_tls"):
-        n = "\U0001f310 " + note + " VLESS-TLS"
-        blocks.append(
-            "  - name: " + n + "\n"
-            "    type: vless\n"
-            "    server: " + domain + "\n"
-            "    port: " + str(tls_cfg["port"]) + "\n"
-            "    uuid: " + uuid + "\n"
-            "    network: tcp\n"
-            "    tls: true\n"
-            "    udp: true\n"
-            "    servername: " + tls_cfg.get("sni", domain) + "\n"
-            "    client-fingerprint: chrome"
-        )
-        names.append(n)
+    names_lines = f"      - \"{n_hy2}\"\n      - \"{n_reality}\""
 
-    if not blocks:
-        n = note
-        blocks.append(
-            "  - name: " + n + "\n"
-            "    type: vless\n"
-            "    server: " + domain + "\n"
-            "    port: 443\n"
-            "    uuid: " + uuid + "\n"
-            "    network: tcp\n"
-            "    tls: true"
-        )
-        names.append(n)
-
-    return blocks, names
-
-def build_clash_yaml(srv, entry):
-    uuid  = entry["uuid"]
-    note  = entry.get("note", uuid[:8])
-    blocks, names = build_proxies(srv, uuid, note)
-    proxies_yaml  = "\n\n".join(blocks)
-    names_indent  = "\n".join("      - " + n for n in names)
-
-    lines = [
-        "proxies:",
-        proxies_yaml,
-        "",
-        "proxy-groups:",
-        "  - name: \U0001f527 " + note + " Manual",
-        "    type: select",
-        "    proxies:",
-        names_indent,
-        "      - DIRECT",
-        "",
-        "  - name: \u26a1 " + note + " Auto",
-        "    type: url-test",
-        "    url: http://www.gstatic.com/generate_204",
-        "    interval: 300",
-        "    tolerance: 50",
-        "    proxies:",
-        names_indent,
-        "",
-        "  - name: \U0001f4fa " + note + " Streaming",
-        "    type: select",
-        "    proxies:",
-        names_indent,
-        "      - DIRECT",
-        "",
-        "dns:",
-        "  enable: true",
-        "  listen: 0.0.0.0:1053",
-        "  enhanced-mode: fake-ip",
-        "  fake-ip-range: 198.18.0.1/16",
-        "  nameserver:",
-        "    - https://doh.pub/dns-query",
-        "    - https://dns.alidns.com/dns-query",
-        "  fallback:",
-        "    - https://1.1.1.1/dns-query",
-        "    - https://dns.google/dns-query",
-        "  fallback-filter:",
-        "    geoip: true",
-        "    geoip-code: CN",
-        "    ipcidr:",
-        "      - 240.0.0.0/4",
-        "  default-nameserver:",
-        "    - 223.5.5.5",
-        "    - 119.29.29.29",
-        "",
-        "rules:",
-        "  - DOMAIN-SUFFIX,localhost,DIRECT",
-        "  - IP-CIDR,127.0.0.0/8,DIRECT",
-        "  - IP-CIDR,192.168.0.0/16,DIRECT",
-        "  - IP-CIDR,10.0.0.0/8,DIRECT",
-        "  - DOMAIN-SUFFIX,baidu.com,DIRECT",
-        "  - DOMAIN-SUFFIX,qq.com,DIRECT",
-        "  - DOMAIN-SUFFIX,wechat.com,DIRECT",
-        "  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT",
-        "  - DOMAIN-SUFFIX,bilibili.com,DIRECT",
-        "  - DOMAIN-SUFFIX,taobao.com,DIRECT",
-        "  - DOMAIN-SUFFIX,jd.com,DIRECT",
-        "  - DOMAIN-SUFFIX,alicdn.com,DIRECT",
-        "  - DOMAIN-SUFFIX,alipay.com,DIRECT",
-        "  - DOMAIN-SUFFIX,163.com,DIRECT",
-        "  - DOMAIN-SUFFIX,126.com,DIRECT",
-        "  - DOMAIN-SUFFIX,zhihu.com,DIRECT",
-        "  - DOMAIN-SUFFIX,csdn.net,DIRECT",
-        "  - DOMAIN-SUFFIX,douyin.com,DIRECT",
-        "  - DOMAIN-SUFFIX,weibo.com,DIRECT",
-        "  - DOMAIN-SUFFIX,youku.com,DIRECT",
-        "  - DOMAIN-SUFFIX,iqiyi.com,DIRECT",
-        "  - DOMAIN-SUFFIX,mi.com,DIRECT",
-        "  - DOMAIN-SUFFIX,huawei.com,DIRECT",
-        "  - DOMAIN-SUFFIX,bytedance.com,DIRECT",
-        "  - GEOIP,CN,DIRECT",
-        "  - MATCH,\U0001f527 " + note + " Manual",
-    ]
-    return "\n".join(lines) + "\n"
+    return (
+        "proxies:\n"
+        f"{proxies}\n\n"
+        "proxy-groups:\n"
+        f"  - name: \"\U0001f527 {note} \u00b7 Manual\"\n"
+        f"    type: select\n"
+        f"    proxies:\n"
+        f"{names_lines}\n"
+        f"      - DIRECT\n\n"
+        f"  - name: \"\u26a1 {note} \u00b7 Auto\"\n"
+        f"    type: url-test\n"
+        f"    url: http://www.gstatic.com/generate_204\n"
+        f"    interval: 300\n"
+        f"    tolerance: 50\n"
+        f"    proxies:\n"
+        f"{names_lines}\n\n"
+        "dns:\n"
+        "  enable: true\n"
+        "  listen: 0.0.0.0:1053\n"
+        "  enhanced-mode: fake-ip\n"
+        "  fake-ip-range: 198.18.0.1/16\n"
+        "  nameserver:\n"
+        "    - https://doh.pub/dns-query\n"
+        "    - https://dns.alidns.com/dns-query\n"
+        "  fallback:\n"
+        "    - https://1.1.1.1/dns-query\n"
+        "    - https://dns.google/dns-query\n"
+        "  fallback-filter:\n"
+        "    geoip: true\n"
+        "    geoip-code: CN\n"
+        "    ipcidr:\n"
+        "      - 240.0.0.0/4\n"
+        "  default-nameserver:\n"
+        "    - 223.5.5.5\n"
+        "    - 119.29.29.29\n\n"
+        "rules:\n"
+        "  - DOMAIN-SUFFIX,localhost,DIRECT\n"
+        "  - IP-CIDR,127.0.0.0/8,DIRECT\n"
+        "  - IP-CIDR,192.168.0.0/16,DIRECT\n"
+        "  - IP-CIDR,10.0.0.0/8,DIRECT\n"
+        "  - DOMAIN-SUFFIX,baidu.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,qq.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,wechat.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,bilibili.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,taobao.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,jd.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,alicdn.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,alipay.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,163.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,126.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,zhihu.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,csdn.net,DIRECT\n"
+        "  - DOMAIN-SUFFIX,douyin.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,weibo.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,youku.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,iqiyi.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,mi.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,huawei.com,DIRECT\n"
+        "  - DOMAIN-SUFFIX,bytedance.com,DIRECT\n"
+        "  - GEOIP,CN,DIRECT\n"
+        f"  - MATCH,\"\U0001f527 {note} \u00b7 Manual\"\n"
+    )
 
 @app.get("/sub")
 def sub():
     token = request.args.get("token", "")
-    if not token:
-        abort(403)
+    if not token: abort(403)
     entry = find_token(token)
-    if not entry:
-        abort(403)
-    srv = load_server()
-    yaml_content = build_clash_yaml(srv, entry)
-    filename = "clash-" + entry.get("note", "sub") + ".yaml"
-    return Response(yaml_content, mimetype="text/plain; charset=utf-8",
-                    headers={"Content-Disposition": "attachment; filename=\"" + filename + "\""})
+    if not entry: abort(403)
+    params = load_params()
+    content = build_yaml(params, entry)
+    fname = "clash-" + entry.get("note","sub") + ".yaml"
+    return Response(content, mimetype="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 @app.get("/health")
 def health():
     return {"status": "ok", "ts": int(time.time())}
 
 if __name__ == "__main__":
-    host = os.environ.get("SUB_API_HOST", "127.0.0.1")
-    port = int(os.environ.get("SUB_API_PORT", 8080))
-    app.run(host=host, port=port, debug=False)
+    app.run(host="127.0.0.1", port=8080, debug=False)
 PYEOF
-  ok "app.py generated"
-}
 
-# ─── 7. 生成 requirements.txt ────────────────────────────────────────────────
-write_requirements() {
-  cat >"$SUB_ROOT/requirements.txt" <<'EOF'
-flask>=3.0
-gunicorn>=21.0
-EOF
-}
+  # ── venv ───────────────────────────────────────────────────────────────
+  python3 -m venv "$SUB_DIR/venv"
+  "$SUB_DIR/venv/bin/pip" install flask gunicorn --quiet
 
-# ─── 8. 安装 Python venv ──────────────────────────────────────────────────────
-venv_install() {
-  log "创建 Python venv…"
-  python3 -m venv "$SUB_ROOT/venv"
-  # shellcheck disable=SC1091
-  source "$SUB_ROOT/venv/bin/activate"
-  pip install --upgrade pip -q
-  pip install -r "$SUB_ROOT/requirements.txt" -q
-  deactivate
-  ok "venv 安装完成"
-}
-
-# ─── 9. 生成 vpn CLI（完整自包含）────────────────────────────────────────────
-write_vpn_cli() {
-  log "生成 vpn CLI…"
-  cat >/usr/local/bin/vpn <<'VPNEOF'
-#!/usr/bin/env bash
-# vpn CLI — 管理 clash-sub-api 订阅用户
-set -euo pipefail
-
-ROOT="/opt/sub-api"
-ENV_FILE="$ROOT/sub-api.env"
-TOKENS_JSON="$ROOT/tokens.json"
-
-# shellcheck disable=SC1090
-[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
-DOMAIN="${SUB_PUBLIC_DOMAIN:-}"
-XRAY_CFG="${XRAY_CONFIG:-}"
-SING_CFG="${SINGBOX_CONFIG:-}"
-XRAY_API_PORT="${XRAY_API_PORT:-10085}"
-
-die()  { echo "[vpn] error: $*" >&2; exit 1; }
-log()  { echo "[vpn] $*" >&2; }
-
-load_tokens() { jq -c . "$TOKENS_JSON" 2>/dev/null || echo '[]'; }
-save_tokens() { echo "$1" | jq . >"$TOKENS_JSON"; chmod 0640 "$TOKENS_JSON"; }
-
-gen_uuid()  { uuidgen | tr '[:upper:]' '[:lower:]'; }
-gen_token() { openssl rand -hex 20; }
-
-# 向单个 JSON 文件添加 VLESS 用户（幂等）
-_xray_add_to_file() {
-  local f="$1" uuid="$2"
-  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' \
-    "$f" >/dev/null 2>&1 || return 0
-  local tmp; tmp="$(mktemp)"
-  jq -M --arg uuid "$uuid" \
-    '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |= (
-       if . == null then [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
-       elif map(select(.id == $uuid)) | length > 0 then .
-       else . + [{id: $uuid, email: $uuid, flow: "xtls-rprx-vision"}]
-       end
-     )' "$f" > "$tmp" && mv "$tmp" "$f"
-}
-
-# 向 Xray config 添加 VLESS 用户
-_xray_add_user() {
-  local uuid="$1"
-  if [[ -d "$XRAY_CFG" ]]; then
-    for f in "$XRAY_CFG"/*.json; do _xray_add_to_file "$f" "$uuid"; done
-  elif [[ -f "$XRAY_CFG" ]]; then
-    _xray_add_to_file "$XRAY_CFG" "$uuid"
-  fi
-}
-
-# 从单个 JSON 文件删除 VLESS 用户
-_xray_del_from_file() {
-  local f="$1" uuid="$2"
-  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' \
-    "$f" >/dev/null 2>&1 || return 0
-  local tmp; tmp="$(mktemp)"
-  jq -M --arg uuid "$uuid" \
-    '(.inbounds[] | select(.protocol=="vless") | .settings.clients) |=
-       map(select(.id != $uuid))' \
-    "$f" > "$tmp" && mv "$tmp" "$f"
-}
-
-# 从 Xray config 删除 VLESS 用户
-_xray_del_user() {
-  local uuid="$1"
-  if [[ -d "$XRAY_CFG" ]]; then
-    for f in "$XRAY_CFG"/*.json; do _xray_del_from_file "$f" "$uuid"; done
-  elif [[ -f "$XRAY_CFG" ]]; then
-    _xray_del_from_file "$XRAY_CFG" "$uuid"
-  fi
-}
-
-# 向 sing-box 添加 Hysteria2 密码
-_singbox_add_user() {
-  local uuid="$1"
-  [[ -f "$SING_CFG" ]] || return 0
-  local tmp; tmp="$(mktemp)"
-  jq -M \
-    --arg pwd "$uuid" \
-    '(.inbounds[] | select(.type=="hysteria2") | .users) |= (
-      if . == null then [{name: $pwd, password: $pwd}]
-      elif map(select(.password == $pwd)) | length > 0 then .
-      else . + [{name: $pwd, password: $pwd}]
-      end
-    )' "$SING_CFG" > "$tmp" && mv "$tmp" "$SING_CFG"
-}
-
-# 向 sing-box 删除 Hysteria2 用户
-_singbox_del_user() {
-  local uuid="$1"
-  [[ -f "$SING_CFG" ]] || return 0
-  local tmp; tmp="$(mktemp)"
-  jq -M \
-    --arg pwd "$uuid" \
-    '(.inbounds[] | select(.type=="hysteria2") | .users) |= map(select(.password != $pwd))' \
-    "$SING_CFG" > "$tmp" && mv "$tmp" "$SING_CFG"
-}
-
-reload_cores() {
-  for svc in xray sing-box v2ray-agent; do
-    systemctl is-active --quiet "$svc" 2>/dev/null && systemctl restart "$svc" && log "restarted $svc" || true
-  done
-  systemctl is-active --quiet sub-api 2>/dev/null && systemctl restart sub-api && log "restarted sub-api" || true
-}
-
-# 从 Xray gRPC Stats API 查询用户流量
-_xray_traffic() {
-  local uuid="$1"
-  local up="-" down="-"
-  if command -v grpcurl >/dev/null 2>&1; then
-    local raw
-    raw="$(grpcurl -plaintext \
-      -d "{\"name\": \"user>>>${uuid}>>>traffic>>>uplink\", \"reset\": false}" \
-      "127.0.0.1:${XRAY_API_PORT}" \
-      xray.app.stats.command.StatsService/GetStats 2>/dev/null || echo '{}')"
-    up="$(echo "$raw" | jq -r '.stat.value // "-"' 2>/dev/null || echo '-')"
-    raw="$(grpcurl -plaintext \
-      -d "{\"name\": \"user>>>${uuid}>>>traffic>>>downlink\", \"reset\": false}" \
-      "127.0.0.1:${XRAY_API_PORT}" \
-      xray.app.stats.command.StatsService/GetStats 2>/dev/null || echo '{}')"
-    down="$(echo "$raw" | jq -r '.stat.value // "-"' 2>/dev/null || echo '-')"
-  else
-    # 尝试 xray API over HTTP (v1.8+)
-    local url_base="http://127.0.0.1:${XRAY_API_PORT}"
-    up="$(curl -sf "${url_base}/v1/stats/user?name=${uuid}&reset=false" 2>/dev/null \
-      | jq -r '.stat.uplink // "-"' 2>/dev/null || echo '-')"
-    down="$(curl -sf "${url_base}/v1/stats/user?name=${uuid}&reset=false" 2>/dev/null \
-      | jq -r '.stat.downlink // "-"' 2>/dev/null || echo '-')"
-  fi
-  echo "${up}|${down}"
-}
-
-_fmt_bytes() {
-  local n="$1"
-  [[ "$n" == "-" || "$n" == "null" ]] && echo "-" && return
-  local gb mb kb
-  gb=$(( n / 1073741824 )); mb=$(( (n % 1073741824) / 1048576 ))
-  kb=$(( (n % 1048576) / 1024 ))
-  if   (( gb > 0 )); then echo "${gb}.$(( mb * 10 / 1024 ))G"
-  elif (( mb > 0 )); then echo "${mb}.$(( kb * 10 / 1024 ))M"
-  elif (( kb > 0 )); then echo "${kb}K"
-  else                    echo "${n}B"; fi
-}
-
-cmd_create() {
-  local note="${1:-device}"
-  local uuid token sub_url
-  uuid="$(gen_uuid)"
-  token="$(gen_token)"
-  [[ -n "$DOMAIN" ]] || die "SUB_PUBLIC_DOMAIN 未设置，请检查 $ENV_FILE"
-
-  _xray_add_user "$uuid"
-  _singbox_add_user "$uuid"
-
-  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local tokens new_entry
-  tokens="$(load_tokens)"
-  new_entry="$(jq -n \
-    --arg token "$token" --arg uuid "$uuid" \
-    --arg note "$note" --arg created "$now" \
-    '{token: $token, uuid: $uuid, note: $note, created: $created}')"
-  tokens="$(echo "$tokens" | jq ". + [$new_entry]")"
-  save_tokens "$tokens"
-
-  reload_cores
-
-  sub_url="https://${DOMAIN}/sub?token=${token}"
-  echo ""
-  echo "┌─────────────────────────────────────────────────────────────┐"
-  echo "│  新用户已创建                                               │"
-  echo "├─────────────────────────────────────────────────────────────┤"
-  printf "│  备注  : %-52s│\n" "$note"
-  printf "│  UUID  : %-52s│\n" "$uuid"
-  printf "│  Token : %-52s│\n" "$token"
-  echo "├─────────────────────────────────────────────────────────────┤"
-  printf "│  订阅 URL:\n"
-  printf "│  %s\n" "$sub_url"
-  echo "└─────────────────────────────────────────────────────────────┘"
-  echo ""
-}
-
-cmd_list() {
-  local tokens
-  tokens="$(load_tokens)"
-  local count; count="$(echo "$tokens" | jq 'length')"
-  echo ""
-  printf "%-12s  %-36s  %-14s  %-8s  %-8s  %-8s  %s\n" \
-    "TOKEN(前8)" "UUID" "备注" "↑VLESS" "↓VLESS" "创建时间" ""
-  printf '%0.s─' {1..100}; echo ""
-  local i=0
-  while [[ $i -lt $count ]]; do
-    local entry token uuid note created traffic up down
-    entry="$(echo "$tokens" | jq -r ".[$i]")"
-    token="$(echo "$entry" | jq -r '.token')"
-    uuid="$(echo "$entry" | jq -r '.uuid')"
-    note="$(echo "$entry" | jq -r '.note // "-"')"
-    created="$(echo "$entry" | jq -r '.created // "-"')"
-    traffic="$(_xray_traffic "$uuid")"
-    up="$(_fmt_bytes "${traffic%%|*}")"
-    down="$(_fmt_bytes "${traffic##*|}")"
-    printf "%-12s  %-36s  %-14s  %-8s  %-8s  %s\n" \
-      "${token:0:8}…" "$uuid" "$note" "$up" "$down" "${created:0:10}"
-    i=$(( i + 1 ))
-  done
-  echo ""
-}
-
-cmd_revoke() {
-  local token="${1:-}"
-  [[ -n "$token" ]] || die "用法: vpn revoke <token>"
-  local tokens entry uuid
-  tokens="$(load_tokens)"
-  entry="$(echo "$tokens" | jq -r "[.[] | select(.token==\"$token\")] | .[0]")"
-  [[ "$entry" != "null" && -n "$entry" ]] || die "Token 不存在: $token"
-  uuid="$(echo "$entry" | jq -r '.uuid')"
-  _xray_del_user "$uuid"
-  _singbox_del_user "$uuid"
-  tokens="$(echo "$tokens" | jq "[.[] | select(.token != \"$token\")]")"
-  save_tokens "$tokens"
-  reload_cores
-  echo "[vpn] 已吊销 token=${token:0:8}… uuid=$uuid"
-}
-
-cmd_url() {
-  local token="${1:-}"
-  [[ -n "$token" ]] || die "用法: vpn url <token>"
-  [[ -n "$DOMAIN" ]] || die "SUB_PUBLIC_DOMAIN 未设置"
-  local entry
-  entry="$(load_tokens | jq -r "[.[] | select(.token==\"$token\")] | .[0]")"
-  [[ "$entry" != "null" && -n "$entry" ]] || die "Token 不存在"
-  echo "https://${DOMAIN}/sub?token=${token}"
-}
-
-cmd_status() {
-  systemctl status sub-api --no-pager -l || true
-}
-
-cmd_reload() {
-  reload_cores
-}
-
-cmd_help() {
-  cat <<'HELP'
-用法: vpn <命令> [参数]
-
-命令:
-  create [备注]     新建用户（生成 token + UUID，写入 Xray/sing-box）
-  list              列出所有用户及流量统计
-  revoke <token>    吊销用户（从 Xray/sing-box 删除）
-  url <token>       打印订阅 URL
-  status            显示 sub-api 服务状态
-  reload            重启 Xray / sing-box / sub-api
-  help              显示此帮助
-HELP
-}
-
-case "${1:-help}" in
-  create)  cmd_create  "${2:-}" ;;
-  list)    cmd_list ;;
-  revoke)  cmd_revoke  "${2:-}" ;;
-  url)     cmd_url     "${2:-}" ;;
-  status)  cmd_status ;;
-  reload)  cmd_reload ;;
-  help|*)  cmd_help ;;
-esac
-VPNEOF
-  chmod +x /usr/local/bin/vpn
-  ok "vpn CLI 安装完成 → /usr/local/bin/vpn"
-}
-
-# ─── 10. 生成 sub-api-stop 工具 ──────────────────────────────────────────────
-write_stop_script() {
-  cat >/usr/local/bin/sub-api-stop <<'EOF'
-#!/usr/bin/env bash
-systemctl stop sub-api && echo "[sub-api-stop] sub-api 已停止" || echo "[sub-api-stop] 停止失败"
-EOF
-  chmod +x /usr/local/bin/sub-api-stop
-}
-
-# ─── 11. systemd 服务 ─────────────────────────────────────────────────────────
-write_systemd() {
-  log "配置 systemd sub-api.service…"
-  cat >/etc/systemd/system/sub-api.service <<EOF
+  # ── systemd ─────────────────────────────────────────────────────────────
+  cat > /etc/systemd/system/sub-api.service <<EOF
 [Unit]
-Description=Clash Subscription API (sub-api)
+Description=Clash Subscription API
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${SUB_ROOT}
-EnvironmentFile=-${ENV_FILE}
-Environment=SUB_ROOT=${SUB_ROOT}
-ExecStart=${SUB_ROOT}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
+WorkingDirectory=${SUB_DIR}
+Environment=INSTALL_DIR=${INSTALL_DIR}
+ExecStart=${SUB_DIR}/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 2 --timeout 30 app:app
 Restart=on-failure
 RestartSec=3
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable sub-api
-  systemctl restart sub-api || true   # 失败继续，下面会检测端口
-
-  # 等待最多 12 秒确认 8080 端口真的在监听
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if ss -tlnp 2>/dev/null | grep -q ':8080 '; then
-      ok "sub-api 启动成功，8080 端口已监听"
-      return 0
-    fi
-    sleep 1
-  done
-  warn "sub-api 启动后 8080 端口未检测到 — 查看日志: journalctl -u sub-api -n 30"
+  ok "订阅 API 部署完成"
 }
 
-# ─── 12. Nginx 配置 ───────────────────────────────────────────────────────────
-# 生成 proxy_pass 片段（Python 写文件，避免 bash heredoc 转义地狱）
-_write_location_snippet() {
-  local dest_file="$1"
-  python3 - "$dest_file" <<'PY'
-import sys
-f = sys.argv[1]
-snippet = """    location /sub {
-        proxy_pass         http://127.0.0.1:8080;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-    }
-    location /health {
-        proxy_pass       http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-    }
-"""
-open(f, "w").write(snippet)
-PY
-}
-
-# 检测当前 Nginx 是否已经代理了 /sub 到 8080
-_nginx_has_sub_proxy() {
-  nginx -T 2>/dev/null | grep -q "proxy_pass.*127.0.0.1:8080" && \
-  nginx -T 2>/dev/null | grep -q "location /sub"
-}
-
-# 修补单个 nginx conf 文件（幂等，用 Python 做插入避免 sed 转义问题）
-_patch_nginx_conf() {
-  local f="$1"
-  [[ -f "$f" ]] || return 1
-  grep -q "location /sub" "$f" && { log "$f 已有 /sub 配置"; return 0; }
-
-  # 写出 snippet 到临时文件
-  local snippet_file; snippet_file="$(mktemp)"
-  _write_location_snippet "$snippet_file"
-
-  python3 - "$f" "$snippet_file" <<'PY'
-import sys, re
-conf_path = sys.argv[1]
-snippet   = open(sys.argv[2]).read()
-text      = open(conf_path).read()
-
-# 在第一个 "location / {" 或 "location ~ ^/s/" 前插入
-markers = [r'^\s*location\s*/\s*\{', r'^\s*location\s*~\s*\^/s/']
-insert_pos = None
-for pat in markers:
-    m = re.search(pat, text, re.MULTILINE)
-    if m:
-        insert_pos = m.start()
-        break
-
-if insert_pos is None:
-    # 找不到 marker，插到最后一个 } 之前
-    insert_pos = text.rfind("}")
-    if insert_pos == -1:
-        print(f"[patch] cannot find insert point in {conf_path}", flush=True)
-        sys.exit(1)
-
-new_text = text[:insert_pos] + snippet + text[insert_pos:]
-open(conf_path, "w").write(new_text)
-print(f"[patch] patched {conf_path}", flush=True)
-PY
-  rm -f "$snippet_file"
-}
-
-# 核心函数：检测 nginx 场景并配置
-configure_nginx() {
+# ─── Nginx 配置 ───────────────────────────────────────────────────────────────
+_setup_nginx() {
   local domain="$1"
-  log "检测 Nginx 配置场景…"
-
-  # ── 场景A：v2ray-agent 的分片配置（conf.d/alone.conf 或 subscribe.conf）
-  local v2ray_nginx_patched=false
-  for cf in /etc/nginx/conf.d/alone.conf /etc/nginx/conf.d/subscribe.conf; do
-    if [[ -f "$cf" ]]; then
-      log "发现 v2ray-agent nginx 配置: $cf"
-      if _patch_nginx_conf "$cf"; then
-        v2ray_nginx_patched=true
-        ok "已修补: $cf"
-      fi
-    fi
-  done
-
-  if $v2ray_nginx_patched; then
-    nginx -t && systemctl reload nginx && ok "v2ray-agent nginx 修补并重载完成"
-    # v2ray-agent 场景下 certbot 证书已存在，不需要新建 server block
-    log "v2ray-agent 场景：跳过新建 server block，证书由 v2ray-agent 管理"
-    return 0
-  fi
-
-  # ── 场景B：纯净 nginx，新建 server block + certbot
-  log "未检测到 v2ray-agent nginx，新建独立站点配置…"
+  log "配置 Nginx..."
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
 
-  # 确保 nginx.conf 包含 sites-enabled
+  # 确保 sites-enabled 被加载
   if ! grep -q 'sites-enabled' /etc/nginx/nginx.conf 2>/dev/null; then
     sed -i '/http {/a\\tinclude /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
   fi
 
-  python3 - "$domain" >/etc/nginx/sites-available/sub-api <<'PY'
-import sys
-d = sys.argv[1]
-print(f"""server {{
+  # 写 HTTP 配置（certbot 会自动改成 HTTPS）
+  cat > /etc/nginx/sites-available/vpn-sub <<EOF
+server {
     listen 80;
     listen [::]:80;
-    server_name {d};
+    server_name ${domain};
     root /var/www/html;
-    location /.well-known/acme-challenge/ {{ }}
-    location /sub {{
+
+    location /.well-known/acme-challenge/ { }
+
+    location /sub {
         proxy_pass         http://127.0.0.1:8080;
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
         proxy_read_timeout 30s;
-    }}
-    location /health {{
+    }
+
+    location /health {
         proxy_pass       http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-    }}
-}}""")
-PY
-  ln -sf /etc/nginx/sites-available/sub-api /etc/nginx/sites-enabled/sub-api
-  nginx -t && systemctl reload nginx && ok "Nginx 站点配置写入完成"
+        proxy_set_header Host \$host;
+    }
 
-  # 申请证书
-  run_certbot "$domain"
+    location / {
+        return 404;
+    }
+}
+EOF
+  # 移除 default site 防止冲突
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/vpn-sub /etc/nginx/sites-enabled/vpn-sub
+  nginx -t && systemctl reload nginx
+  ok "Nginx 配置完成"
 }
 
-# ─── 13. Let's Encrypt ───────────────────────────────────────────────────────
-run_certbot() {
-  local domain="$1"
-  log "申请 TLS 证书（域名: $domain）…"
+# ─── 保存状态 ─────────────────────────────────────────────────────────────────
+_save_state() {
+  local domain="$1" ip="$2" xray_port="$3" hy2_port="$4" dest="$5" cert_mode="$6"
+  local params; params="$(cat "$INSTALL_DIR/xray-params.json")"
+  echo "$params" | jq \
+    --arg domain "$domain" --arg ip "$ip" \
+    --arg cert_mode "$cert_mode" \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + {domain: $domain, server_ip: $ip,
+          cert_mode: $cert_mode, installed_at: $installed_at}' \
+    > "$STATE_FILE"
 
-  if certbot certificates 2>/dev/null | grep -q "Domains:.*${domain}"; then
-    ok "证书已存在，跳过申请"
-    return 0
-  fi
-
-  local args=(--nginx -d "$domain" --non-interactive --agree-tos --redirect)
-  if [[ -n "${CERTBOT_EMAIL:-}" ]]; then
-    args+=(--email "$CERTBOT_EMAIL")
-  else
-    args+=(--register-unsafely-without-email)
-  fi
-
-  certbot "${args[@]}" && ok "证书申请成功" || {
-    warn "certbot 失败 — 请确认域名已解析且 80 端口可访问"
-    warn "手动补跑: certbot --nginx -d ${domain} --agree-tos --register-unsafely-without-email --redirect"
-  }
-  nginx -t && systemctl reload nginx || true
+  # 同步 cert_mode 到 params
+  cp "$STATE_FILE" "$INSTALL_DIR/xray-params.json"
 }
 
-# ─── 14. 重启核心服务 ────────────────────────────────────────────────────────
-reload_cores() {
-  log "重启代理核心…"
-  for svc in xray sing-box v2ray-agent; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-      systemctl restart "$svc" && ok "restarted $svc" || warn "restart $svc failed"
+# ─── 启动服务 ─────────────────────────────────────────────────────────────────
+_start_services() {
+  log "启动服务..."
+  local failed=()
+
+  for svc in xray hysteria2 sub-api nginx; do
+    systemctl restart "$svc" 2>/dev/null || { failed+=("$svc"); continue; }
+    sleep 1
+    if systemctl is-active --quiet "$svc"; then
+      ok "$svc 已启动"
+    else
+      warn "$svc 启动异常，查看日志: journalctl -u $svc -n 20"
+      failed+=("$svc")
     fi
+  done
+
+  # 检查 sub-api 8080 端口
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    ss -tlnp 2>/dev/null | grep -q ':8080 ' && break
+    sleep 1
+  done
+  ss -tlnp 2>/dev/null | grep -q ':8080 ' \
+    && ok "sub-api 8080 端口监听正常" \
+    || warn "sub-api 8080 端口未检测到，请查看: journalctl -u sub-api -n 30"
+
+  [[ ${#failed[@]} -eq 0 ]] || warn "以下服务启动有问题: ${failed[*]}"
+}
+
+# ─── 创建用户 ─────────────────────────────────────────────────────────────────
+_create_user() {
+  local note="$1"
+  [[ -f "$STATE_FILE" ]] || { err "未安装，请先执行安装"; return 1; }
+
+  local uuid; uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  local token; token="$(openssl rand -hex 20)"
+  local domain; domain="$(jq -r '.domain' "$STATE_FILE")"
+  local hy2_port; hy2_port="$(jq -r '.hy2_port' "$STATE_FILE")"
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # 写入 Xray 配置
+  local tmp; tmp="$(mktemp)"
+  jq --arg uuid "$uuid" \
+    '.inbounds[0].settings.clients += [{
+       "id": $uuid, "email": $uuid, "flow": "xtls-rprx-vision"
+     }]' "$XRAY_CONF/config.json" > "$tmp" && mv "$tmp" "$XRAY_CONF/config.json"
+
+  # 写入 Hysteria2 配置（多密码用 userpass 方式）
+  _hy2_add_user "$uuid"
+
+  # 写入 tokens.json
+  local tokens; tokens="$(cat "$TOKENS_FILE")"
+  tokens="$(echo "$tokens" | jq \
+    --arg token "$token" --arg uuid "$uuid" \
+    --arg note "$note" --arg created "$now" \
+    '. + [{token: $token, uuid: $uuid, note: $note, created: $created}]')"
+  echo "$tokens" > "$TOKENS_FILE"
+  chmod 640 "$TOKENS_FILE"
+
+  # 重启服务使配置生效
+  systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true
+  systemctl restart hysteria2 2>/dev/null || true
+
+  local sub_url="https://${domain}/sub?token=${token}"
+  echo ""
+  echo -e "  ${GREEN}┌─────────────────────────────────────────────────────┐${RESET}"
+  echo -e "  ${GREEN}│  新用户创建成功                                     │${RESET}"
+  echo -e "  ${GREEN}├─────────────────────────────────────────────────────┤${RESET}"
+  printf   "  ${GREEN}│${RESET}  备注  : %-43s${GREEN}│${RESET}\n" "$note"
+  printf   "  ${GREEN}│${RESET}  UUID  : %-43s${GREEN}│${RESET}\n" "$uuid"
+  printf   "  ${GREEN}│${RESET}  Token : %-43s${GREEN}│${RESET}\n" "${token:0:20}..."
+  echo -e "  ${GREEN}├─────────────────────────────────────────────────────┤${RESET}"
+  echo -e "  ${GREEN}│${RESET}  订阅 URL:"
+  echo -e "  ${GREEN}│${RESET}  ${BOLD}${sub_url}${RESET}"
+  echo -e "  ${GREEN}└─────────────────────────────────────────────────────┘${RESET}"
+}
+
+# Hysteria2 多用户：改为 userpass 认证
+_hy2_add_user() {
+  local uuid="$1"
+  # 读取当前所有用户 UUID
+  local all_uuids=()
+  # 已有的
+  while IFS= read -r u; do
+    [[ -n "$u" ]] && all_uuids+=("$u")
+  done < <(jq -r '.[].uuid' "$TOKENS_FILE" 2>/dev/null || true)
+  all_uuids+=("$uuid")
+
+  # 重建 Hysteria2 userpass 配置
+  local domain; domain="$(jq -r '.domain' "$STATE_FILE")"
+  local hy2_port; hy2_port="$(jq -r '.hy2_port' "$STATE_FILE")"
+  local cert_mode; cert_mode="$(jq -r '.cert_mode' "$STATE_FILE")"
+
+  # 构建 userpass 块
+  local userpass_block=""
+  for u in "${all_uuids[@]}"; do
+    userpass_block+="  ${u}: ${u}"$'\n'
+  done
+
+  cat > "$HY2_CONF/config.yaml" <<EOF
+listen: :${hy2_port}
+
+tls:
+  cert: /etc/ssl/vpn/cert.pem
+  key:  /etc/ssl/vpn/key.pem
+
+auth:
+  type: userpass
+  userpass:
+${userpass_block}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${domain}
+    rewriteHost: true
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+EOF
+}
+
+# ─── 用户管理菜单 ──────────────────────────────────────────────────────────────
+user_menu() {
+  while true; do
+    clear
+    echo -e "${BOLD}=== 用户管理 ===${RESET}"
+    hr
+    echo "  1) 新建用户"
+    echo "  2) 查看所有用户"
+    echo "  3) 吊销用户"
+    echo "  0) 返回主菜单"
+    hr
+    read -rp "  请选择 [0-3]: " choice
+    case "$choice" in
+      1)
+        read -rp "  用户备注: " note
+        [[ -z "$note" ]] && note="device-$(date +%s)"
+        _create_user "$note"
+        read -rp "  按回车继续..." _
+        ;;
+      2) _list_users; read -rp "  按回车继续..." _ ;;
+      3) _revoke_user_prompt; read -rp "  按回车继续..." _ ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
   done
 }
 
-# ─── 初始化 tokens.json ───────────────────────────────────────────────────────
-init_tokens() {
-  [[ -f "$TOKENS_JSON" ]] || { echo '[]' >"$TOKENS_JSON"; chmod 0640 "$TOKENS_JSON"; }
+_list_users() {
+  [[ -f "$TOKENS_FILE" ]] || { warn "tokens.json 不存在"; return; }
+  local count; count="$(jq 'length' "$TOKENS_FILE")"
+  echo ""
+  echo -e "  共 ${BOLD}${count}${RESET} 个用户"
+  hr
+  printf "  %-20s  %-36s  %-12s  %s\n" "备注" "UUID" "Token(前8)" "创建时间"
+  hr
+  local i=0
+  while [[ $i -lt $count ]]; do
+    local entry; entry="$(jq -r ".[$i]" "$TOKENS_FILE")"
+    local note;  note="$(echo  "$entry" | jq -r '.note')"
+    local uuid;  uuid="$(echo  "$entry" | jq -r '.uuid')"
+    local token; token="$(echo "$entry" | jq -r '.token')"
+    local ts;    ts="$(echo    "$entry" | jq -r '.created' | cut -c1-10)"
+    printf "  %-20s  %-36s  %-12s  %s\n" "$note" "$uuid" "${token:0:8}…" "$ts"
+    i=$(( i + 1 ))
+  done
 }
 
-# ─── 打印部署摘要 ─────────────────────────────────────────────────────────────
-print_summary() {
-  local domain="$1"
+_revoke_user_prompt() {
+  _list_users
   echo ""
-  echo "═══════════════════════════════════════════════════════════════"
-  echo "  clash-sub-api 部署完成"
-  echo "═══════════════════════════════════════════════════════════════"
-  echo "  订阅域名  : https://${domain}/sub?token=<token>"
-  echo "  健康检查  : https://${domain}/health"
-  echo "  配置文件  : ${SERVER_JSON}"
-  echo "  环境变量  : ${ENV_FILE}"
-  echo ""
-  echo "  常用命令:"
-  echo "    vpn create <备注>   # 新建用户"
-  echo "    vpn list            # 查看用户与流量"
-  echo "    vpn revoke <token>  # 吊销用户"
-  echo "    vpn reload          # 重启服务"
-  echo "    sudo sub-api-stop   # 停止订阅 API"
-  echo "═══════════════════════════════════════════════════════════════"
-  echo ""
+  read -rp "  输入要吊销的 Token 前8位（或完整 Token）: " tok_input
+  [[ -z "$tok_input" ]] && return
+
+  local found_token found_uuid
+  found_token="$(jq -r --arg t "$tok_input" \
+    '[.[] | select(.token | startswith($t))] | .[0].token // ""' "$TOKENS_FILE")"
+  [[ -z "$found_token" ]] && { warn "未找到匹配的 Token"; return; }
+
+  found_uuid="$(jq -r --arg t "$found_token" \
+    '.[] | select(.token == $t) | .uuid' "$TOKENS_FILE")"
+
+  # 从 Xray 删除
+  local tmp; tmp="$(mktemp)"
+  jq --arg uuid "$found_uuid" \
+    '.inbounds[0].settings.clients = [.inbounds[0].settings.clients[] | select(.id != $uuid)]' \
+    "$XRAY_CONF/config.json" > "$tmp" && mv "$tmp" "$XRAY_CONF/config.json"
+
+  # 从 tokens.json 删除
+  tmp="$(mktemp)"
+  jq --arg t "$found_token" '[.[] | select(.token != $t)]' "$TOKENS_FILE" > "$tmp"
+  mv "$tmp" "$TOKENS_FILE"
+  chmod 640 "$TOKENS_FILE"
+
+  # 重建 Hysteria2 配置（不含该用户）
+  local domain; domain="$(jq -r '.domain' "$STATE_FILE")"
+  local hy2_port; hy2_port="$(jq -r '.hy2_port' "$STATE_FILE")"
+  local userpass_block=""
+  while IFS= read -r u; do
+    [[ -n "$u" ]] && userpass_block+="  ${u}: ${u}"$'\n'
+  done < <(jq -r '.[].uuid' "$TOKENS_FILE" 2>/dev/null || true)
+
+  local cert_mode; cert_mode="$(jq -r '.cert_mode' "$STATE_FILE")"
+  cat > "$HY2_CONF/config.yaml" <<EOF
+listen: :${hy2_port}
+
+tls:
+  cert: /etc/ssl/vpn/cert.pem
+  key:  /etc/ssl/vpn/key.pem
+
+auth:
+  type: userpass
+  userpass:
+${userpass_block}
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${domain}
+    rewriteHost: true
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+EOF
+
+  systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true
+  systemctl restart hysteria2 2>/dev/null || true
+  ok "用户已吊销: $found_uuid"
 }
 
-# ─── 主流程 ───────────────────────────────────────────────────────────────────
-main() {
-  need_root
-
-  local domain
-  domain="$(require_domain "${1:-}")"
-
-  log "开始部署 clash-sub-api → 域名: $domain"
-
-  # ── 停止所有旧服务 ──────────────────────────────────────────────────────────
-  log "停止旧服务…"
-  # 停 sub-api（若存在）
-  if systemctl is-active --quiet sub-api 2>/dev/null; then
-    systemctl stop sub-api && log "stopped sub-api" || true
-  fi
-  systemctl disable sub-api 2>/dev/null || true
-
-  # 杀掉任何仍然占用 8080 的进程
-  local pids
-  pids="$(ss -tlnp 2>/dev/null | awk '/:8080 /{print $0}'          | grep -oP 'pid=\K[0-9]+' || true)"
-  if [[ -n "$pids" ]]; then
-    log "杀掉占用 8080 的进程: $pids"
-    echo "$pids" | xargs -r kill -9 2>/dev/null || true
-    sleep 1
-  fi
-
-  # 清理旧的 venv / app（保留 tokens.json）
-  if [[ -d "$SUB_ROOT/venv" ]]; then
-    log "清理旧 venv…"
-    rm -rf "$SUB_ROOT/venv"
-  fi
-
-  # 确保 nginx 在运行（certbot 需要）
-  if ! systemctl is-active --quiet nginx 2>/dev/null; then
-    systemctl start nginx || true
-  fi
-  ok "旧服务清理完成"
-
-  # 安装依赖
-  install_packages
-
-  # 探测配置
-  local paths xray_path sing_path
-  paths="$(discover_configs)"
-  xray_path="${paths%%|*}"
-  sing_path="${paths##*|}"
-
-  # 初始化目录
-  mkdir -p "$SUB_ROOT"
-  init_tokens
-
-  # 生成配置文件
-  write_env "$domain" "$xray_path" "$sing_path"
-  build_server_json "$domain" "$xray_path" "$sing_path"
-
-  # 注入 Xray stats
-  inject_xray_stats "$xray_path"
-
-  # 重启代理核心（让 stats API 生效）
-  [[ -n "$xray_path" ]] && reload_cores || true
-
-  # 生成 Python 应用
-  write_app_py
-  write_requirements
-  venv_install
-
-  # 安装 CLI 工具
-  write_vpn_cli
-  write_stop_script
-
-  # 配置系统服务
-  write_systemd
-
-  # 配置 Nginx（自动检测 v2ray-agent 场景 vs 纯净场景）
-  configure_nginx "$domain"
-
-  # 创建首个用户
-  log "创建首个订阅用户…"
-  SUB_PUBLIC_DOMAIN="$domain" /usr/local/bin/vpn create "first-device" || true
-
-  print_summary "$domain"
+# ─── 状态显示 ─────────────────────────────────────────────────────────────────
+show_status() {
+  clear
+  echo -e "${BOLD}=== 服务状态 ===${RESET}"
+  hr
+  for svc in xray hysteria2 sub-api nginx; do
+    local status
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      status="${GREEN}● 运行中${RESET}"
+    else
+      status="${RED}● 已停止${RESET}"
+    fi
+    printf "  %-12s %b\n" "$svc" "$status"
+  done
+  hr
+  echo -e "  ${BOLD}端口监听:${RESET}"
+  ss -tlnp 2>/dev/null | awk 'NR>1 {printf "  %s\n", $4}' | sort -u
+  hr
+  read -rp "  按回车返回..." _
 }
 
-main "$@"
+# ─── 节点信息 ─────────────────────────────────────────────────────────────────
+show_node_info() {
+  clear
+  [[ -f "$STATE_FILE" ]] || { warn "未安装"; read -rp "按回车..." _; return; }
+
+  local domain;    domain="$(jq -r '.domain' "$STATE_FILE")"
+  local ip;        ip="$(jq -r '.server_ip' "$STATE_FILE")"
+  local xray_port; xray_port="$(jq -r '.xray_port' "$STATE_FILE")"
+  local hy2_port;  hy2_port="$(jq -r '.hy2_port' "$STATE_FILE")"
+  local pubkey;    pubkey="$(jq -r '.xray_reality_pubkey' "$STATE_FILE")"
+  local short_id;  short_id="$(jq -r '.xray_reality_short_id' "$STATE_FILE")"
+  local dest;      dest="$(jq -r '.xray_dest' "$STATE_FILE")"
+
+  echo -e "${BOLD}=== 节点参数 ===${RESET}"
+  hr
+  echo -e "  ${BOLD}Xray VLESS + Reality + uTLS${RESET}"
+  echo "  地址        : $domain"
+  echo "  端口        : $xray_port"
+  echo "  协议        : vless"
+  echo "  传输        : tcp"
+  echo "  伪装域名    : $dest"
+  echo "  PublicKey   : $pubkey"
+  echo "  ShortID     : $short_id"
+  echo "  Flow        : xtls-rprx-vision"
+  echo "  指纹        : chrome"
+  hr
+  echo -e "  ${BOLD}Hysteria2${RESET}"
+  echo "  地址        : $domain"
+  echo "  端口        : $hy2_port"
+  echo "  密码        : <每个用户的 UUID>"
+  echo "  SNI         : $domain"
+  hr
+  echo -e "  ${BOLD}订阅链接格式${RESET}"
+  echo "  https://${domain}/sub?token=<你的token>"
+  echo ""
+  echo -e "  ${BOLD}所有用户订阅 URL:${RESET}"
+  local count; count="$(jq 'length' "$TOKENS_FILE" 2>/dev/null || echo 0)"
+  local i=0
+  while [[ $i -lt $count ]]; do
+    local entry; entry="$(jq -r ".[$i]" "$TOKENS_FILE")"
+    local note;  note="$(echo  "$entry" | jq -r '.note')"
+    local token; token="$(echo "$entry" | jq -r '.token')"
+    echo "  [$note]"
+    echo "  https://${domain}/sub?token=${token}"
+    echo ""
+    i=$(( i + 1 ))
+  done
+  hr
+  read -rp "  按回车返回..." _
+}
+
+# ─── 重启服务 ─────────────────────────────────────────────────────────────────
+restart_all() {
+  log "重启所有服务..."
+  for svc in xray hysteria2 sub-api nginx; do
+    systemctl restart "$svc" 2>/dev/null \
+      && ok "$svc 已重启" \
+      || warn "$svc 重启失败"
+  done
+  read -rp "  按回车返回..." _
+}
+
+# ─── 卸载 ─────────────────────────────────────────────────────────────────────
+do_uninstall() {
+  clear
+  echo -e "${RED}${BOLD}=== 卸载 VPN 服务 ===${RESET}"
+  hr
+  echo -e "  ${RED}警告：此操作将删除所有 VPN 服务、配置和用户数据！${RESET}"
+  echo ""
+  read -rp "  确认卸载？输入 YES 继续: " confirm
+  [[ "$confirm" == "YES" ]] || { log "已取消"; read -rp "按回车..." _; return; }
+
+  log "停止并删除服务..."
+  for svc in xray hysteria2 sub-api; do
+    systemctl stop    "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service"
+  done
+  systemctl daemon-reload
+
+  log "删除配置和程序..."
+  rm -rf "$INSTALL_DIR"
+  rm -rf "$XRAY_CONF"
+  rm -rf "$HY2_CONF"
+  rm -rf "/etc/ssl/vpn"
+  rm -f  "$XRAY_DIR/xray"
+  rm -f  "/usr/local/bin/hysteria"
+  rm -rf "$LOG_DIR"
+
+  # 删除 nginx 站点
+  rm -f /etc/nginx/sites-enabled/vpn-sub
+  rm -f /etc/nginx/sites-available/vpn-sub
+  nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+
+  ok "卸载完成"
+  read -rp "  按回车退出..." _
+  exit 0
+}
+
+# ─── 入口 ─────────────────────────────────────────────────────────────────────
+need_root
+
+# 修复 /etc/hosts 中可能缺失的 hostname 条目（解决 sudo warning）
+local_hostname="$(hostname 2>/dev/null || true)"
+if [[ -n "$local_hostname" ]] && ! grep -q "$local_hostname" /etc/hosts 2>/dev/null; then
+  echo "127.0.0.1 $local_hostname" >> /etc/hosts
+fi
+
+main_menu
