@@ -408,166 +408,192 @@ EOF
 
 # ─── 6. 生成 app.py（Flask 订阅服务）────────────────────────────────────────
 write_app_py() {
-  log "生成 app.py…"
+  log "生成 app.py..."
   cat >"$SUB_ROOT/app.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""
-Clash 订阅 API  —  /sub?token=<token>  返回 YAML 配置
-"""
-import json, os, secrets, socket, sys, time
+import json, os, time
 from pathlib import Path
 from flask import Flask, request, Response, abort
 
-ROOT = Path(os.environ.get("SUB_ROOT", "/opt/sub-api"))
+ROOT        = Path(os.environ.get("SUB_ROOT", "/opt/sub-api"))
 SERVER_JSON = ROOT / "server.json"
 TOKENS_JSON = ROOT / "tokens.json"
-
 app = Flask(__name__)
 
-
-def load_server() -> dict:
+def load_server():
     return json.loads(SERVER_JSON.read_text())
 
-
-def load_tokens() -> list:
+def load_tokens():
     try:
         return json.loads(TOKENS_JSON.read_text())
     except Exception:
         return []
 
-
-def save_tokens(tokens: list):
-    TOKENS_JSON.write_text(json.dumps(tokens, indent=2, ensure_ascii=False))
-    TOKENS_JSON.chmod(0o640)
-
-
-def find_token(token: str) -> dict | None:
+def find_token(token):
     for t in load_tokens():
         if t.get("token") == token:
             return t
     return None
 
+def build_proxies(srv, uuid, note):
+    domain  = srv["domain"]
+    reality = srv.get("vless_reality", {})
+    tls_cfg = srv.get("vless_tls",    {})
+    hy2     = srv.get("hysteria2",    {})
+    meta    = srv.get("meta",         {})
+    blocks, names = [], []
 
-def build_clash_yaml(srv: dict, entry: dict) -> str:
-    domain    = srv["domain"]
-    uuid      = entry["uuid"]
-    note      = entry.get("note", uuid[:8])
-    reality   = srv.get("vless_reality", {})
-    tls_cfg   = srv.get("vless_tls", {})
-    hy2       = srv.get("hysteria2", {})
-    meta      = srv.get("meta", {})
-
-    proxies = []
+    # Hysteria2 (fastest, first)
+    if hy2.get("port"):
+        n = "\U0001f680 " + note + " Hysteria2"
+        alpn_yaml = "\n".join("      - " + a for a in hy2.get("alpn", ["h3"]))
+        blocks.append(
+            "  - name: " + n + "\n"
+            "    type: hysteria2\n"
+            "    server: " + domain + "\n"
+            "    port: " + str(hy2["port"]) + "\n"
+            "    password: " + uuid + "\n"
+            "    sni: " + hy2.get("sni", domain) + "\n"
+            "    skip-cert-verify: false\n"
+            "    udp: true\n"
+            "    alpn:\n" + alpn_yaml
+        )
+        names.append(n)
 
     # VLESS + REALITY
     if meta.get("has_reality") and reality.get("public_key"):
-        proxies.append(f"""\
-  - name: "{note}-reality"
-    type: vless
-    server: {domain}
-    port: {reality['port']}
-    uuid: {uuid}
-    network: tcp
-    tls: true
-    udp: true
-    flow: {reality.get('flow','xtls-rprx-vision')}
-    servername: {reality.get('sni', domain)}
-    reality-opts:
-      public-key: "{reality['public_key']}"
-      short-id: "{reality.get('short_id','')}"
-    client-fingerprint: chrome""")
+        n = "\U0001f512 " + note + " VLESS-Reality"
+        blocks.append(
+            "  - name: " + n + "\n"
+            "    type: vless\n"
+            "    server: " + domain + "\n"
+            "    port: " + str(reality["port"]) + "\n"
+            "    uuid: " + uuid + "\n"
+            "    network: tcp\n"
+            "    tls: true\n"
+            "    udp: true\n"
+            "    flow: " + reality.get("flow", "xtls-rprx-vision") + "\n"
+            "    servername: " + reality.get("sni", domain) + "\n"
+            "    reality-opts:\n"
+            "      public-key: " + reality["public_key"] + "\n"
+            "      short-id: " + reality.get("short_id", "") + "\n"
+            "    client-fingerprint: chrome"
+        )
+        names.append(n)
 
     # VLESS + TLS
     if meta.get("has_tls"):
-        proxies.append(f"""\
-  - name: "{note}-tls"
-    type: vless
-    server: {domain}
-    port: {tls_cfg['port']}
-    uuid: {uuid}
-    network: tcp
-    tls: true
-    udp: true
-    flow: {tls_cfg.get('flow','')}
-    servername: {tls_cfg.get('sni', domain)}
-    client-fingerprint: chrome""")
+        n = "\U0001f310 " + note + " VLESS-TLS"
+        blocks.append(
+            "  - name: " + n + "\n"
+            "    type: vless\n"
+            "    server: " + domain + "\n"
+            "    port: " + str(tls_cfg["port"]) + "\n"
+            "    uuid: " + uuid + "\n"
+            "    network: tcp\n"
+            "    tls: true\n"
+            "    udp: true\n"
+            "    servername: " + tls_cfg.get("sni", domain) + "\n"
+            "    client-fingerprint: chrome"
+        )
+        names.append(n)
 
-    # Hysteria2
-    if hy2.get("port"):
-        alpn = ", ".join(hy2.get("alpn", ["h3"]))
-        proxies.append(f"""\
-  - name: "{note}-hy2"
-    type: hysteria2
-    server: {domain}
-    port: {hy2['port']}
-    password: {uuid}
-    sni: {hy2.get('sni', domain)}
-    alpn:
-      - {alpn}""")
+    if not blocks:
+        n = note
+        blocks.append(
+            "  - name: " + n + "\n"
+            "    type: vless\n"
+            "    server: " + domain + "\n"
+            "    port: 443\n"
+            "    uuid: " + uuid + "\n"
+            "    network: tcp\n"
+            "    tls: true"
+        )
+        names.append(n)
 
-    if not proxies:
-        proxies.append(f"""\
-  - name: "{note}-vless"
-    type: vless
-    server: {domain}
-    port: {reality.get('port', tls_cfg.get('port', 443))}
-    uuid: {uuid}
-    network: tcp
-    tls: true""")
+    return blocks, names
 
-    proxy_names = []
-    for p in proxies:
-        for ln in p.splitlines():
-            m = ln.strip()
-            if m.startswith("name:"):
-                proxy_names.append(m.split(":",1)[1].strip().strip('"'))
-                break
+def build_clash_yaml(srv, entry):
+    uuid  = entry["uuid"]
+    note  = entry.get("note", uuid[:8])
+    blocks, names = build_proxies(srv, uuid, note)
+    proxies_yaml  = "\n\n".join(blocks)
+    names_indent  = "\n".join("      - " + n for n in names)
 
-    names_yaml = "\n".join(f"      - {n}" for n in proxy_names)
-    proxies_yaml = "\n".join(proxies)
-
-    return f"""\
-mixed-port: 7890
-allow-lan: true
-mode: Rule
-log-level: info
-ipv6: false
-dns:
-  enable: true
-  ipv6: false
-  nameserver:
-    - 8.8.8.8
-    - 1.1.1.1
-  fallback:
-    - tls://8.8.8.8:853
-    - tls://1.1.1.1:853
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-
-proxies:
-{proxies_yaml}
-
-proxy-groups:
-  - name: "Proxy"
-    type: select
-    proxies:
-{names_yaml}
-      - DIRECT
-
-  - name: "Auto"
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    proxies:
-{names_yaml}
-
-rules:
-  - DOMAIN-SUFFIX,cn,DIRECT
-  - DOMAIN-SUFFIX,gov.cn,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,Proxy
-"""
-
+    lines = [
+        "proxies:",
+        proxies_yaml,
+        "",
+        "proxy-groups:",
+        "  - name: \U0001f527 " + note + " Manual",
+        "    type: select",
+        "    proxies:",
+        names_indent,
+        "      - DIRECT",
+        "",
+        "  - name: \u26a1 " + note + " Auto",
+        "    type: url-test",
+        "    url: http://www.gstatic.com/generate_204",
+        "    interval: 300",
+        "    tolerance: 50",
+        "    proxies:",
+        names_indent,
+        "",
+        "  - name: \U0001f4fa " + note + " Streaming",
+        "    type: select",
+        "    proxies:",
+        names_indent,
+        "      - DIRECT",
+        "",
+        "dns:",
+        "  enable: true",
+        "  listen: 0.0.0.0:1053",
+        "  enhanced-mode: fake-ip",
+        "  fake-ip-range: 198.18.0.1/16",
+        "  nameserver:",
+        "    - https://doh.pub/dns-query",
+        "    - https://dns.alidns.com/dns-query",
+        "  fallback:",
+        "    - https://1.1.1.1/dns-query",
+        "    - https://dns.google/dns-query",
+        "  fallback-filter:",
+        "    geoip: true",
+        "    geoip-code: CN",
+        "    ipcidr:",
+        "      - 240.0.0.0/4",
+        "  default-nameserver:",
+        "    - 223.5.5.5",
+        "    - 119.29.29.29",
+        "",
+        "rules:",
+        "  - DOMAIN-SUFFIX,localhost,DIRECT",
+        "  - IP-CIDR,127.0.0.0/8,DIRECT",
+        "  - IP-CIDR,192.168.0.0/16,DIRECT",
+        "  - IP-CIDR,10.0.0.0/8,DIRECT",
+        "  - DOMAIN-SUFFIX,baidu.com,DIRECT",
+        "  - DOMAIN-SUFFIX,qq.com,DIRECT",
+        "  - DOMAIN-SUFFIX,wechat.com,DIRECT",
+        "  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT",
+        "  - DOMAIN-SUFFIX,bilibili.com,DIRECT",
+        "  - DOMAIN-SUFFIX,taobao.com,DIRECT",
+        "  - DOMAIN-SUFFIX,jd.com,DIRECT",
+        "  - DOMAIN-SUFFIX,alicdn.com,DIRECT",
+        "  - DOMAIN-SUFFIX,alipay.com,DIRECT",
+        "  - DOMAIN-SUFFIX,163.com,DIRECT",
+        "  - DOMAIN-SUFFIX,126.com,DIRECT",
+        "  - DOMAIN-SUFFIX,zhihu.com,DIRECT",
+        "  - DOMAIN-SUFFIX,csdn.net,DIRECT",
+        "  - DOMAIN-SUFFIX,douyin.com,DIRECT",
+        "  - DOMAIN-SUFFIX,weibo.com,DIRECT",
+        "  - DOMAIN-SUFFIX,youku.com,DIRECT",
+        "  - DOMAIN-SUFFIX,iqiyi.com,DIRECT",
+        "  - DOMAIN-SUFFIX,mi.com,DIRECT",
+        "  - DOMAIN-SUFFIX,huawei.com,DIRECT",
+        "  - DOMAIN-SUFFIX,bytedance.com,DIRECT",
+        "  - GEOIP,CN,DIRECT",
+        "  - MATCH,\U0001f527 " + note + " Manual",
+    ]
+    return "\n".join(lines) + "\n"
 
 @app.get("/sub")
 def sub():
@@ -579,22 +605,20 @@ def sub():
         abort(403)
     srv = load_server()
     yaml_content = build_clash_yaml(srv, entry)
+    filename = "clash-" + entry.get("note", "sub") + ".yaml"
     return Response(yaml_content, mimetype="text/plain; charset=utf-8",
-                    headers={"Content-Disposition":
-                             f'attachment; filename="clash-{entry.get("note","sub")}.yaml"'})
-
+                    headers={"Content-Disposition": "attachment; filename=\"" + filename + "\""})
 
 @app.get("/health")
 def health():
     return {"status": "ok", "ts": int(time.time())}
-
 
 if __name__ == "__main__":
     host = os.environ.get("SUB_API_HOST", "127.0.0.1")
     port = int(os.environ.get("SUB_API_PORT", 8080))
     app.run(host=host, port=port, debug=False)
 PYEOF
-  ok "app.py 生成完成"
+  ok "app.py generated"
 }
 
 # ─── 7. 生成 requirements.txt ────────────────────────────────────────────────
