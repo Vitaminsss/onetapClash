@@ -174,6 +174,8 @@ _install_ip_mode(){
   _check_api_health || true
   _wait_port "$sub_port" "Nginx(订阅)"
 
+  _firewall_open_ports_ip "$hy2_port" "$sub_port"
+
   ok "安装完成！"
   echo ""
   read -rp "  用户备注 [默认 my-device]: " _note
@@ -251,6 +253,8 @@ _install_domain_mode(){
 
   _check_api_health || true
 
+  _firewall_open_ports_domain "$hy2_port" "$xray_port"
+
   ok "安装完成！"
   echo ""
   read -rp "  用户备注 [默认 my-device]: " _note
@@ -287,10 +291,79 @@ _pkg_install(){
   apt-get install -y -qq \
     curl wget unzip jq openssl uuid-runtime \
     python3 python3-venv python3-pip \
-    iproute2 2>&1 | tail -1
+    iproute2 ufw \
+    2>&1 | tail -1
   command -v nginx   >/dev/null 2>&1 || apt-get install -y -qq nginx 2>&1 | tail -1
   command -v certbot >/dev/null 2>&1 || apt-get install -y -qq certbot python3-certbot-nginx 2>&1 | tail -1
   ok "依赖安装完成"
+}
+
+# ── 防火墙：云安全组仍须手动；本机默认 apt 安装 ufw 并写入规则（inactive 时规则待 enable 后生效）─
+_firewall_open_ports_ip(){
+  local hy2="$1" sub_tcp="$2"
+  echo ""
+  echo -e "${Y}【云安全组 / 厂商控制台】必须放行（与是否安装 ufw 无关）：${N}"
+  echo "     UDP ${hy2}     ← Hysteria2（QUIC）"
+  echo "     TCP ${sub_tcp}  ← 订阅（Nginx）"
+  echo ""
+
+  if command -v ufw >/dev/null 2>&1; then
+    log "写入 ufw 放行规则..."
+    ufw allow "${hy2}/udp"   comment 'Hysteria2'  2>/dev/null || ufw allow "${hy2}/udp"
+    ufw allow "${sub_tcp}/tcp" comment 'sub-api' 2>/dev/null || ufw allow "${sub_tcp}/tcp"
+    if ufw status 2>/dev/null | head -1 | grep -qi "Status: active"; then
+      ok "ufw 已启用，UDP ${hy2} / TCP ${sub_tcp} 已生效"
+    else
+      ok "ufw 规则已写入（当前防火墙未 enable，规则未拦截流量）。若需启用本机防火墙:"
+      echo "     sudo ufw allow OpenSSH && sudo ufw allow ${hy2}/udp && sudo ufw allow ${sub_tcp}/tcp && sudo ufw enable"
+    fi
+  else
+    warn "未找到 ufw（不应发生）。请手动: sudo apt-get install -y ufw"
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    log "检测到 firewalld，正在放行端口..."
+    firewall-cmd --permanent --add-port="${hy2}/udp"   2>/dev/null || true
+    firewall-cmd --permanent --add-port="${sub_tcp}/tcp" 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+    ok "firewalld: UDP ${hy2}, TCP ${sub_tcp}"
+  fi
+}
+
+_firewall_open_ports_domain(){
+  local hy2="$1" xray="$2"
+  echo ""
+  echo -e "${Y}【云安全组 / 厂商控制台】必须放行：${N}"
+  echo "     UDP ${hy2}     ← Hysteria2（QUIC）"
+  echo "     TCP ${xray}    ← Xray VLESS Reality"
+  echo "     TCP 80 / 443   ← HTTP(S) / 证书"
+  echo ""
+
+  if command -v ufw >/dev/null 2>&1; then
+    log "写入 ufw 放行规则..."
+    ufw allow "${hy2}/udp"   comment 'Hysteria2' 2>/dev/null || ufw allow "${hy2}/udp"
+    ufw allow "${xray}/tcp"  comment 'Xray'      2>/dev/null || ufw allow "${xray}/tcp"
+    ufw allow 80/tcp  comment 'HTTP'  2>/dev/null || ufw allow 80/tcp
+    ufw allow 443/tcp comment 'HTTPS' 2>/dev/null || ufw allow 443/tcp
+    if ufw status 2>/dev/null | head -1 | grep -qi "Status: active"; then
+      ok "ufw 已启用，HY2/Xray/80/443 已生效"
+    else
+      ok "ufw 规则已写入（当前未 enable）。启用示例:"
+      echo "     sudo ufw allow OpenSSH && sudo ufw allow ${hy2}/udp && sudo ufw allow ${xray}/tcp && sudo ufw allow 80,443/tcp && sudo ufw enable"
+    fi
+  else
+    warn "未找到 ufw。请: sudo apt-get install -y ufw"
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    log "检测到 firewalld，正在放行端口..."
+    firewall-cmd --permanent --add-port="${hy2}/udp"    2>/dev/null || true
+    firewall-cmd --permanent --add-port="${xray}/tcp"   2>/dev/null || true
+    firewall-cmd --permanent --add-service=http         2>/dev/null || true
+    firewall-cmd --permanent --add-service=https        2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+    ok "firewalld: 已放行 HY2 / Xray / http / https"
+  fi
 }
 
 _install_xray_bin(){
