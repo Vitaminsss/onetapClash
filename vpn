@@ -27,27 +27,23 @@ hook_log() { echo "[sub-api] $*" >&2; }
 merge_xray_stats() {
   local f="$1"
   [[ -f "$f" ]] || { hook_log "Xray config not found: $f"; return 1; }
+  # 只在含有 vless inbound 的文件里注入 stats（Xray v26 api 段不含 listen/port）
+  jq -e '[.inbounds? // [] | .[] | select(.protocol=="vless")] | length > 0' "$f" >/dev/null 2>&1 || return 0
   local tmp
   tmp="$(mktemp)"
-  jq --argjson port "$XRAY_API_PORT" '
+  jq -M '
     .stats = (.stats // {})
     | .api = (
         if (.api | type) == "object" then
           .api
-          | .listen = (.listen // "127.0.0.1")
-          | .port = ($port | tonumber)
           | .services = (
               (.services // []) as $s
               | if ($s | index("StatsService")) then $s else $s + ["StatsService"] end
               | if index("HandlerService") then . else . + ["HandlerService"] end
             )
+          | del(.listen) | del(.port)
         else
-          {
-            "tag": "api",
-            "listen": "127.0.0.1",
-            "port": ($port | tonumber),
-            "services": ["HandlerService", "StatsService"]
-          }
+          {"tag": "api", "services": ["HandlerService", "StatsService"]}
         end
       )
     | .policy = (
