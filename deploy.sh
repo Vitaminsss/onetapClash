@@ -45,8 +45,9 @@ require_domain() {
   [[ -n "$domain" ]] || die "用法: sudo bash deploy.sh <your.domain.com>
 可选: CERTBOT_EMAIL=you@example.com sudo bash deploy.sh <your.domain.com>"
   # 基本格式验证
-  [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-\.]+)?[a-zA-Z0-9]$ ]] \
-    || warn "域名格式疑似不对: $domain"
+  # 基本格式验证（含多级子域名）
+  [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] \
+    || warn "域名格式疑似不对，请确认: $domain"
   echo "$domain"
 }
 
@@ -821,7 +822,7 @@ cmd_list() {
     down="$(_fmt_bytes "${traffic##*|}")"
     printf "%-12s  %-36s  %-14s  %-8s  %-8s  %s\n" \
       "${token:0:8}…" "$uuid" "$note" "$up" "$down" "${created:0:10}"
-    (( i++ ))
+    i=$(( i + 1 ))
   done
   echo ""
 }
@@ -922,16 +923,16 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable sub-api
-  systemctl restart sub-api
+  systemctl restart sub-api || true   # 失败继续，下面会检测端口
 
   # 等待最多 12 秒确认 8080 端口真的在监听
-  local i=0
-  while [[ $i -lt 12 ]]; do
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if ss -tlnp 2>/dev/null | grep -q ':8080 '; then
       ok "sub-api 启动成功，8080 端口已监听"
       return 0
     fi
-    sleep 1; (( i++ ))
+    sleep 1
   done
   warn "sub-api 启动后 8080 端口未检测到 — 查看日志: journalctl -u sub-api -n 30"
 }
@@ -1138,9 +1139,34 @@ main() {
 
   log "开始部署 clash-sub-api → 域名: $domain"
 
-  # 停止旧服务（不停 nginx，certbot 需要它）
-  systemctl stop sub-api 2>/dev/null || true
-  systemctl is-active --quiet nginx 2>/dev/null || systemctl start nginx || true
+  # ── 停止所有旧服务 ──────────────────────────────────────────────────────────
+  log "停止旧服务…"
+  # 停 sub-api（若存在）
+  if systemctl is-active --quiet sub-api 2>/dev/null; then
+    systemctl stop sub-api && log "stopped sub-api" || true
+  fi
+  systemctl disable sub-api 2>/dev/null || true
+
+  # 杀掉任何仍然占用 8080 的进程
+  local pids
+  pids="$(ss -tlnp 2>/dev/null | awk '/:8080 /{print $0}'          | grep -oP 'pid=\K[0-9]+' || true)"
+  if [[ -n "$pids" ]]; then
+    log "杀掉占用 8080 的进程: $pids"
+    echo "$pids" | xargs -r kill -9 2>/dev/null || true
+    sleep 1
+  fi
+
+  # 清理旧的 venv / app（保留 tokens.json）
+  if [[ -d "$SUB_ROOT/venv" ]]; then
+    log "清理旧 venv…"
+    rm -rf "$SUB_ROOT/venv"
+  fi
+
+  # 确保 nginx 在运行（certbot 需要）
+  if ! systemctl is-active --quiet nginx 2>/dev/null; then
+    systemctl start nginx || true
+  fi
+  ok "旧服务清理完成"
 
   # 安装依赖
   install_packages
